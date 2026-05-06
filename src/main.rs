@@ -1,3 +1,16 @@
+mod parser;
+
+use std::fs::{self, File};
+use std::io::prelude::*;
+use parser::Torrent;
+
 fn main() {
-    println!("Hello, world!");
+    let mut torrent_file = fs::read("/home/daksh/Downloads/Resident Evil 4 (2023) [FitGirl Repack].torrent").unwrap();
+    // let mut contents = String::new();
+    // let _ =torrent_file.read_to_string(&mut contents);
+
+    let deserialized: Torrent = serde_bencode::from_bytes(&torrent_file).unwrap();
+
+    println!("{:?}", deserialized);
+    // println!("{}", contents);
 }

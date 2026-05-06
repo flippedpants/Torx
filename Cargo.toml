@@ -4,3 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+reqwest = "0.13.3"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_bencode = "0.2.4"
+serde_bytes = "0.11.19"
+tokio = { version = "1.52.2", features = ["full"] }
