@@ -50,3 +50,4 @@ pub struct TorrentFile{
     pub length: u64,
     pub path: Vec<String>
 }
+

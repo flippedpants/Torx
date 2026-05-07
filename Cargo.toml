@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+memchr = "2.8.0"
 reqwest = "0.13.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_bencode = "0.2.4"

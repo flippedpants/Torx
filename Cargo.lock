@@ -1287,6 +1287,7 @@ dependencies = [
 name = "torx"
 version = "0.1.0"
 dependencies = [
+ "memchr",
  "reqwest",
  "serde",
  "serde_bencode",

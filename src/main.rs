@@ -1,4 +1,5 @@
 mod parser;
+mod build_header;
 
 use std::fs::{self, File};
 use std::io::prelude::*;
@@ -13,21 +14,4 @@ fn main() {
 
     // println!("{:?}", file_content);
 
-    let announce_url = file_content.announce;
-    let announce_list = file_content.announce_list.unwrap_or_default();
-    let torrent_name = file_content.info.name;
-    let pieces = file_content.info.pieces;
-    let piece_len = file_content.info.piece_len;
-    
-    let mut single_file_length: u64;
-    let mut torrent_files: Vec<parser::TorrentFile>;
-    
-    match file_content.info.mode {
-        parser::FileMode::SingleFileMode { length } => {
-            single_file_length = length;
-        },
-        parser::FileMode::MultiFileMode { files } => {
-            torrent_files = files;
-        }
-    }
 }
