@@ -4,6 +4,7 @@ mod build_header;
 use std::fs::{self, File};
 use std::io::prelude::*;
 use parser::Torrent;
+use build_header::{calculate_info_hash, extract_value};
 
 fn main() {
     let mut torrent_file = fs::read("/home/daksh/Downloads/Resident Evil 4 (2023) [FitGirl Repack].torrent").unwrap();
@@ -14,4 +15,6 @@ fn main() {
 
     // println!("{:?}", file_content);
 
+    extract_value(file_content);
+    calculate_info_hash(torrent_file);
 }
