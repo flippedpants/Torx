@@ -1,6 +1,6 @@
 use crate::parser::{self, Torrent};
 use memchr::memmem;
-use sha1::{Digest, Sha1, digest::FixedOutput};
+use sha1::{Digest, Sha1};
 
 pub fn extract_value(file_content: parser::Torrent){
     let announce_url = file_content.announce;
@@ -31,17 +31,43 @@ pub fn calculate_info_hash(torrent_file: &Vec<u8>){
 
     let index = memmem::find(&torrent_file, pattern).unwrap();
     //Do Error handling
-  
-    // println!("{:?}", &torrent_file[index+4..]);
 
     let mut depth = 0;
-    let mut info_end_index: usize;
+    let mut info_end_index: usize = 0;
+    let after_info_slice = &torrent_file[index+6..];
+    let after_info_len = torrent_file.len() - (index + 6);
+    let mut i = 0;
 
-    for i in (index+6..torrent_file.len()){
-        if torrent_file[i] == b'd' || torrent_file[i] == b'l'{
+    while i <= after_info_len{
+        if after_info_slice[i].is_ascii_digit(){
+            let mut colon_index = i;
+
+            while after_info_slice[colon_index] != b':'{
+                colon_index += 1;
+            }
+
+            let str_len_bytes = &after_info_slice[i..colon_index];
+
+            let str_len: usize = std::str::from_utf8(str_len_bytes).unwrap().parse().unwrap();
+
+            i = colon_index + str_len + 1;
+            continue; 
+        }
+        if after_info_slice[i] == b'i'{
+            loop {
+                i += 1;
+                if after_info_slice[i] == b'e'{
+                    i += 1;
+                    break;
+                }
+            }
+            continue;
+        }
+
+        if after_info_slice[i] == b'd' || after_info_slice[i] == b'l'{
             depth += 1;
         }
-        else if torrent_file[i] == b'e'{
+        else if after_info_slice[i] == b'e'{
             depth -= 1;
         }
 
@@ -51,7 +77,7 @@ pub fn calculate_info_hash(torrent_file: &Vec<u8>){
                 break;
             }
             _ => {
-                continue;
+                i += 1;
             }
         }
     }
