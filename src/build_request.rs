@@ -2,35 +2,30 @@ use crate::parser::{self};
 use memchr::memmem;
 use sha1::{Digest, Sha1};
 
-pub fn extract_value(file_content: parser::Torrent){
-    let announce_url = file_content.announce;
-    let announce_list = file_content.announce_list.unwrap_or_default();
-    let torrent_name = file_content.info.name;
-    let pieces = file_content.info.pieces;
-    let piece_len = file_content.info.piece_len;
+// pub fn extract_value(file_content: &parser::Torrent){
+//     let announce_url = &file_content.announce;
+//     let announce_list = &file_content.announce_list.unwrap_or_default();
+//     let torrent_name = &file_content.info.name;
+//     let pieces = &file_content.info.pieces;
+//     let piece_len = &file_content.info.piece_len;
     
-    let mut single_file_length: u64;
-    let mut torrent_files: Vec<parser::TorrentFile>;
+//     let mut single_file_length: &u64;
+//     let mut torrent_files: &Vec<parser::TorrentFile>;
     
-    match file_content.info.mode {
-        parser::FileMode::SingleFileMode { length } => {
-            single_file_length = length;
-        },
-        parser::FileMode::MultiFileMode { files } => {
-            torrent_files = files;
-        }
-    }
-}
+//     match &file_content.info.mode {
+//         parser::FileMode::SingleFileMode { length } => {
+//             single_file_length = length;
+//         },
+//         parser::FileMode::MultiFileMode { files } => {
+//             torrent_files = files;
+//         }
+//     }
+// }
 
 pub fn calculate_info_hash(torrent_file: &Vec<u8>) -> Result<String, String>{
     let pattern = b"4:info"; 
 
-    // Find the first occurrence
-    // let info_start_index = file_content.windows(pattern.len())
-    // .position(|window| window == pattern);
-
     let info_start_index = memmem::find(&torrent_file, pattern).ok_or("4:info pattern not found")?;
-    //Do Error handling
 
     let mut depth = 0;
     let mut info_end_index: usize = 0;
@@ -100,4 +95,40 @@ pub fn calculate_info_hash(torrent_file: &Vec<u8>) -> Result<String, String>{
 
     // println!("SHA-1 hash : {}", info_hash_hex);
     Ok(info_hash_hex)
+}
+
+pub fn split_pieces(concat_pieces: &Vec<u8>) -> Vec<[u8; 20]> {
+    let mut pieces: Vec<[u8; 20]> = vec![]; 
+
+    let mut i = 0;
+    while i < concat_pieces.len(){
+        if i+20 > concat_pieces.len(){
+            panic!("Piece might be corrupted!");
+        }
+
+        let piece_slice = &concat_pieces[i..i+20]; 
+        let piece= piece_slice.try_into().expect("Piece with incorrect length");
+        pieces.push(piece);
+
+        i += 20; 
+    }
+
+    pieces
+}
+
+pub fn calculate_torrent_size(file_content: &parser::Torrent) -> u64{
+    let mut total_length = 0;
+
+    match &file_content.info.mode{
+        parser::FileMode::SingleFileMode { length } => {
+            total_length = *length;
+        }
+        parser::FileMode::MultiFileMode { files } => {
+            for i in 0..files.len(){
+                total_length += files[i].length;
+            }
+        }
+    };
+
+    total_length
 }
