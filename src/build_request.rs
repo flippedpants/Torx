@@ -1,26 +1,9 @@
 use crate::parser::{self};
 use memchr::memmem;
 use sha1::{Digest, Sha1};
+use rand::{self, distr::{ Alphanumeric, SampleString}};
 
-// pub fn extract_value(file_content: &parser::Torrent){
-//     let announce_url = &file_content.announce;
-//     let announce_list = &file_content.announce_list.unwrap_or_default();
-//     let torrent_name = &file_content.info.name;
-//     let pieces = &file_content.info.pieces;
-//     let piece_len = &file_content.info.piece_len;
-    
-//     let mut single_file_length: &u64;
-//     let mut torrent_files: &Vec<parser::TorrentFile>;
-    
-//     match &file_content.info.mode {
-//         parser::FileMode::SingleFileMode { length } => {
-//             single_file_length = length;
-//         },
-//         parser::FileMode::MultiFileMode { files } => {
-//             torrent_files = files;
-//         }
-//     }
-// }
+const TORRENT_ID: &str = "TX"; 
 
 pub fn calculate_info_hash(torrent_file: &Vec<u8>) -> Result<String, String>{
     let pattern = b"4:info"; 
@@ -130,5 +113,70 @@ pub fn calculate_torrent_size(file_content: &parser::Torrent) -> u64{
         }
     };
 
+    let piece_length = &file_content.info.piece_len;
+
+    let piece_count = total_length.div_ceil(*piece_length);
+
     total_length
+}
+
+pub fn generate_id() -> String{
+    let rand_num = rand::random_range(0..=9999);
+    let rand_alphanum = Alphanumeric.sample_string(&mut rand::rng(), 12);
+
+    let peer_id = format!("-{}{:04}-{}", TORRENT_ID, rand_num, rand_alphanum);
+
+    peer_id
+}
+
+pub fn build_http_url(file_content: &parser::Torrent, torrent_file: &Vec<u8>) -> String{
+    let info_hash_hex = calculate_info_hash(torrent_file).unwrap();
+
+    const PORT: i32 = 6881;
+
+    // let announce_url = find_https_tracker(&file_content.announce_list).unwrap();
+    let announce_url = "https://tracker.zhuqiy.com:443/announce".to_string();
+    let encoded_info_hash: String = hash_encoding(info_hash_hex);
+    let peer_id = generate_id();
+    let uploaded = 0;
+    let downloaded = 0;
+    let downloading_left = calculate_torrent_size(file_content);
+    let compact = 1;
+    
+    let url = format!("{}?info_hash={}&peer_id={}&port={}&uploaded={}&downloaded={}&left={}&compact={}",
+                                announce_url,encoded_info_hash,peer_id,PORT,uploaded,downloaded,downloading_left,compact);
+
+    url
+}
+
+fn hash_encoding(text: String) -> String{
+    let mut encoded_text = "".to_string();
+
+    let mut i = 0;
+    while i < text.len(){
+        let two_chars = &text[i..=i+1];
+        let two_chars_uppercase = two_chars.to_uppercase();  
+        let two_chars_encoded = format!("%{}", two_chars_uppercase);
+
+        encoded_text.push_str(&two_chars_encoded);
+        i += 2;
+    }
+
+    encoded_text
+}
+
+pub fn find_https_tracker(announce_list: &Option<Vec<Vec<String>>>) -> Option<String> {
+    if let Some(trackers) = announce_list {
+
+        for tier in trackers {
+            for tracker in tier {
+
+                if tracker.starts_with("http://") {
+                    return Some(tracker.clone());
+                }
+
+            }
+        }
+    }
+    None
 }
