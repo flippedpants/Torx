@@ -1475,6 +1475,7 @@ dependencies = [
 name = "torx"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "memchr",
  "rand 0.10.1",
  "reqwest",

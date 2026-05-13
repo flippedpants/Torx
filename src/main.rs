@@ -1,10 +1,13 @@
 mod parser;
 mod build_request;
+mod response;
 
-use std::fs::{self};
+use std::{fs::{self}, io::Read};
 use parser::Torrent;
 use build_request::{calculate_info_hash, split_pieces, calculate_torrent_size, generate_id, build_http_url};
 use reqwest::blocking::Client;
+
+use crate::response::parse_response;
 
 fn main() {
     let torrent_file = fs::read("/home/daksh/Downloads/Resident Evil 4 (2023) [FitGirl Repack].torrent").unwrap();
@@ -27,8 +30,7 @@ fn main() {
 
     // println!("{:?}", response);
 
-    match response{
-        Ok(res) => println!("{:?}",res),
-        Err(e) => eprintln!("{}", e)
-    }
+    let response_body = response.unwrap().bytes().unwrap();
+    parse_response(&response_body);
+
 }
