@@ -1,6 +1,7 @@
 mod parser;
 mod build_request;
 mod response;
+mod connect_peers;
 
 use std::{fs::{self}, io::Read};
 use parser::Torrent;

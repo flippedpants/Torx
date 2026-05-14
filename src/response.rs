@@ -22,12 +22,12 @@ pub struct Response{
 }
 
 #[derive(Debug)]
-struct PeerAddress{
+pub struct PeerAddress{
     ip: String,
     port: u16
 }
 
-pub fn parse_response(response_byte: &bytes::Bytes){
+pub fn parse_response(response_byte: &bytes::Bytes) -> Vec<PeerAddress>{
     let res: Response = serde_bencode::from_bytes(response_byte).unwrap();
 
     // println!("{:?}", response);
@@ -59,4 +59,5 @@ pub fn parse_response(response_byte: &bytes::Bytes){
     println!("{:#?}", peer_list);
     println!("{}", peer_list.len());
 
+    peer_list
 }   

@@ -5,7 +5,7 @@ use rand::{self, distr::{ Alphanumeric, SampleString}};
 
 const TORRENT_ID: &str = "TX"; 
 
-pub fn calculate_info_hash(torrent_file: &Vec<u8>) -> Result<String, String>{
+pub fn calculate_info_hash(torrent_file: &Vec<u8>) -> Result<(String,[u8; 20]), String>{
     let pattern = b"4:info"; 
 
     let info_start_index = memmem::find(&torrent_file, pattern).ok_or("4:info pattern not found")?;
@@ -69,15 +69,17 @@ pub fn calculate_info_hash(torrent_file: &Vec<u8>) -> Result<String, String>{
     let mut sha1_hasher = Sha1::new();
     sha1_hasher.update(&torrent_file[info_start_index+6..=info_end_index + info_start_index + 6]);
 
-    let info_hash = sha1_hasher.finalize();
+    let info_hash_bytes: [u8; 20] = sha1_hasher.finalize().into();
 
-    let info_hash_hex: String = info_hash
+    let info_hash_hex: String = info_hash_bytes
     .iter()
     .map(|b| format!("{:02x}", b))
     .collect();
 
     // println!("SHA-1 hash : {}", info_hash_hex);
-    Ok(info_hash_hex)
+    let info_hash = (info_hash_hex, info_hash_bytes);
+
+    Ok(info_hash)
 }
 
 pub fn split_pieces(concat_pieces: &Vec<u8>) -> Vec<[u8; 20]> {
@@ -135,9 +137,10 @@ pub fn build_http_url(file_content: &parser::Torrent, torrent_file: &Vec<u8>) ->
     const PORT: i32 = 6881;
 
     // let announce_url = find_https_tracker(&file_content.announce_list).unwrap();
-    // let announce_url = "https://tracker.zhuqiy.com:443/announce".to_string(); 
-    let announce_url = "https://tracker.yemekyedim.com:443/announce".to_string(); 
-    let encoded_info_hash: String = hash_encoding(info_hash_hex);
+    let announce_url = "https://tracker.zhuqiy.com:443/announce".to_string(); 
+    // let announce_url = "https://tracker.yemekyedim.com:443/announce".to_string(); 
+    
+    let encoded_info_hash: String = hash_encoding(info_hash_hex.0);
     let peer_id = generate_id();
     let uploaded = 0;
     let downloaded = 0;
