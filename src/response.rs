@@ -23,8 +23,8 @@ pub struct Response{
 
 #[derive(Debug)]
 pub struct PeerAddress{
-    ip: String,
-    port: u16
+    pub ip: String,
+    pub port: u16
 }
 
 pub fn parse_response(response_byte: &bytes::Bytes) -> Vec<PeerAddress>{

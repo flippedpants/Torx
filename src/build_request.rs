@@ -131,7 +131,7 @@ pub fn generate_id() -> String{
     peer_id
 }
 
-pub fn build_http_url(file_content: &parser::Torrent, torrent_file: &Vec<u8>) -> String{
+pub fn build_http_url(file_content: &parser::Torrent, torrent_file: &Vec<u8>, peer_id: &str) -> String{
     let info_hash_hex = calculate_info_hash(torrent_file).unwrap();
 
     const PORT: i32 = 6881;
@@ -141,7 +141,7 @@ pub fn build_http_url(file_content: &parser::Torrent, torrent_file: &Vec<u8>) ->
     // let announce_url = "https://tracker.yemekyedim.com:443/announce".to_string(); 
     
     let encoded_info_hash: String = hash_encoding(info_hash_hex.0);
-    let peer_id = generate_id();
+    let peer_id = peer_id;
     let uploaded = 0;
     let downloaded = 0;
     let downloading_left = calculate_torrent_size(file_content);
@@ -175,7 +175,7 @@ pub fn find_https_tracker(announce_list: &Option<Vec<Vec<String>>>) -> Option<St
         for tier in trackers {
             for tracker in tier {
 
-                if tracker.starts_with("http://") {
+                if tracker.starts_with("https://") {
                     return Some(tracker.clone());
                 }
 

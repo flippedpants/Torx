@@ -1,4 +1,6 @@
-use crate::{build_request::generate_id, response::parse_response};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpStream, time::{timeout, Duration}};
+
+use crate::{response::parse_response};
 
 pub struct Handshake{
     info_hash: [u8; 20],
@@ -13,20 +15,65 @@ impl Handshake{
         }
     }
 
-    fn serialize(&self){
+    fn serialize(&self) -> [u8;68]{
         let mut buf: [u8; 68] = [0; 68];
         buf[0] = 19;
-        buf[1..=19].copy_from_slice(b"BitTorrent Protocol");
+        buf[1..=19].copy_from_slice(b"BitTorrent protocol");
         buf[28..=47].copy_from_slice(&self.info_hash);
         buf[48..=67].copy_from_slice(&self.peer_id);
+
+        buf
     }
 }
 
-pub fn connect(response_bytes: &bytes::Bytes, peer_id: [u8; 20], info_hash_bytes: [u8; 20]){
-    let peers = parse_response(&response_bytes);
+pub async fn connect_to_peer(tracker_response_bytes: &bytes::Bytes, peer_id: [u8; 20],info_hash_bytes: [u8; 20]) -> Result<TcpStream, Box<dyn std::error::Error>> {
+    let peers = parse_response(tracker_response_bytes);
     let handshake = Handshake::new(info_hash_bytes, peer_id);
+    let req_bytes = handshake.serialize();
 
-    for i in 0..peers.len(){
+    for peer in peers {
+        let addr = format!("{}:{}", peer.ip, peer.port);
+
+        let connection_attempt = TcpStream::connect(&addr);
+
+        match timeout(Duration::from_secs(3), connection_attempt).await {
+            Ok(Ok(mut stream)) => {
+
+                if let Err(e) = stream.write_all(&req_bytes).await {
+                    eprintln!("Failed to write handshake to {}: {}", addr, e);
+                    continue;
+                }
+
+                let mut res_buf = [0u8; 68];
+                if let Err(e) = stream.read_exact(&mut res_buf).await {
+                    eprintln!("Failed to read handshake from {}: {}", addr, e);
+                    continue;
+                }
+
+
+                if res_buf[0] != 19 || &res_buf[1..=19] != b"BitTorrent protocol" {
+                    eprintln!("Invalid protocol response from {}", addr);
+                    continue;
+                }
+
+                if &res_buf[28..48] != &info_hash_bytes {
+                    eprintln!("Info hash mismatch with peer {}", addr);
+                    continue;
+                }
+
+                println!("Successfully handshaked with {}", addr);
+                return Ok(stream);         
+            }
+            Ok(Err(e)) => {
+                eprintln!("Connection failed to {}: {}", addr, e);
+            }
+             Err(_) => {
+                eprintln!("Connection to {} timed out", addr);
+            }
+        }
         
+
     }
+
+    Err("No valid peer found among the list".into())
 }
