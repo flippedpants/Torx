@@ -12,10 +12,10 @@ use crate::{connect_peers::{connect_to_peer}, response::parse_response};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let torrent_file = fs::read("/home/daksh/Downloads/Resident Evil 4 (2023) [FitGirl Repack].torrent").unwrap();
+    let torrent_file = fs::read("/home/daksh/Downloads/Resident Evil 7 - Biohazard [FitGirl Repack].torrent").unwrap();
 
     let file_content: Torrent = serde_bencode::from_bytes(&torrent_file).unwrap();
-
+    
     println!("{:?}", file_content.info.mode);
 
     // extract_value(file_content);
