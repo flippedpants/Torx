@@ -1,14 +1,14 @@
 mod parser;
 mod build_request;
 mod response;
-mod connect_peers;
+mod connect_peer;
+mod parse_message;
 
-use std::{fs::{self}, io::Read};
+use std::fs::{self};
 use parser::Torrent;
 use build_request::{calculate_info_hash, split_pieces, calculate_torrent_size, generate_id, build_http_url};
 
-
-use crate::{connect_peers::{connect_to_peer}, response::parse_response};
+use crate::{connect_peer::{tcp_bitTorrent_handshake}, response::parse_response};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -40,7 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let peer_id_bytes: [u8; 20] = generate_id().as_bytes().try_into().expect("Length Mismatch");
     let info_hash_bytes = info_hash.1;
 
-    match connect_to_peer(&tracker_response_body, peer_id_bytes, info_hash_bytes).await{
+    match tcp_bitTorrent_handshake(&tracker_response_body, peer_id_bytes, info_hash_bytes).await{
         Ok(s) => {
             println!("Connected and handshaked successfully!");
         }

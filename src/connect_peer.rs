@@ -1,6 +1,6 @@
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpStream, time::{timeout, Duration}};
 
-use crate::{response::parse_response};
+use crate::{parse_message::read_message, response::parse_response};
 
 pub struct Handshake{
     info_hash: [u8; 20],
@@ -26,7 +26,7 @@ impl Handshake{
     }
 }
 
-pub async fn connect_to_peer(tracker_response_bytes: &bytes::Bytes, peer_id: [u8; 20],info_hash_bytes: [u8; 20]) -> Result<TcpStream, Box<dyn std::error::Error>> {
+pub async fn tcp_bitTorrent_handshake(tracker_response_bytes: &bytes::Bytes, peer_id: [u8; 20],info_hash_bytes: [u8; 20]) -> Result<TcpStream, Box<dyn std::error::Error>> {
     let peers = parse_response(tracker_response_bytes);
     let handshake = Handshake::new(info_hash_bytes, peer_id);
     let req_bytes = handshake.serialize();
@@ -62,43 +62,7 @@ pub async fn connect_to_peer(tracker_response_bytes: &bytes::Bytes, peer_id: [u8
                 }
 
                 println!("Successfully handshaked with {}", addr);
-
-                let mut prefix_length_buf = [0u8; 4];
-                if let Err(e) = stream.read_exact(&mut prefix_length_buf).await{
-                    eprintln!("Error - {}", e);
-                    continue;
-                }
-                println!("{:?}", &prefix_length_buf);
-
-                let payload_length = u32::from_be_bytes(prefix_length_buf) as usize;
-                let mut payload = vec![0u8; payload_length];
-                if payload_length > 0 {
-                    match timeout(Duration::from_secs(5), stream.read_exact(&mut payload)).await {
-                        Ok(Ok(_)) => println!("Successfully read all {} bytes", payload_length),
-                        Ok(Err(e)) => {
-                            eprintln!("Network error while reading payload: {}", e);
-                            continue;
-                        }
-                        Err(_) => {
-                            eprintln!("Timed out waiting for {} bytes from peer.", payload_length);
-                            continue; 
-                        }
-                    }
-                } 
-
-                if payload[0] == 5{
-                    let mut interested_req = [0u8, 0u8, 0u8, 1u8, 2u8];
-                    if let Err(e) = stream.write_all(&mut interested_req).await{
-                        eprintln!("Error while sending interested_req - {}", e);
-                        continue;
-                    }
-
-                    let mut reply = [0u8; 5];
-                    let x =stream.read_exact(&mut reply).await.unwrap();
-
-                    println!("{:?}", &reply);
-                }
-
+                let message = read_message(&mut stream).await?;
                 
                 return Ok(stream);         
             }
