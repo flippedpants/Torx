@@ -3,6 +3,7 @@ mod build_request;
 mod response;
 mod connect_peer;
 mod parse_message;
+mod download;
 
 use std::fs::{self};
 use parser::Torrent;
@@ -12,7 +13,7 @@ use crate::{connect_peer::{tcp_bitTorrent_handshake}, response::parse_response};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let torrent_file = fs::read("/home/daksh/Downloads/Resident Evil 7 - Biohazard [FitGirl Repack].torrent").unwrap();
+    let torrent_file = fs::read("/home/daksh/Downloads/Black Myth - Wukong [FitGirl Repack].torrent").unwrap();
 
     let file_content: Torrent = serde_bencode::from_bytes(&torrent_file).unwrap();
     
@@ -40,9 +41,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let peer_id_bytes: [u8; 20] = generate_id().as_bytes().try_into().expect("Length Mismatch");
     let info_hash_bytes = info_hash.1;
 
-    match tcp_bitTorrent_handshake(&tracker_response_body, peer_id_bytes, info_hash_bytes).await{
+    match tcp_bitTorrent_handshake(&file_content, &tracker_response_body, peer_id_bytes, info_hash_bytes).await{
         Ok(s) => {
-            println!("Connected and handshaked successfully!");
+            println!("Connected and downloaded successfully!");
         }
         Err(e) => {
             eprintln!("Error: {}", e)

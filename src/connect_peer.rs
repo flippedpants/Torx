@@ -1,6 +1,6 @@
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpStream, time::{timeout, Duration}};
 
-use crate::{parse_message::read_message, response::parse_response};
+use crate::{download::download_piece, parse_message::read_message, parser, response::parse_response};
 
 pub struct Handshake{
     info_hash: [u8; 20],
@@ -26,7 +26,7 @@ impl Handshake{
     }
 }
 
-pub async fn tcp_bitTorrent_handshake(tracker_response_bytes: &bytes::Bytes, peer_id: [u8; 20],info_hash_bytes: [u8; 20]) -> Result<TcpStream, Box<dyn std::error::Error>> {
+pub async fn tcp_bitTorrent_handshake(file_content: &parser::Torrent,tracker_response_bytes: &bytes::Bytes, peer_id: [u8; 20],info_hash_bytes: [u8; 20]) -> Result<TcpStream, Box<dyn std::error::Error>> {
     let peers = parse_response(tracker_response_bytes);
     let handshake = Handshake::new(info_hash_bytes, peer_id);
     let req_bytes = handshake.serialize();
@@ -62,8 +62,15 @@ pub async fn tcp_bitTorrent_handshake(tracker_response_bytes: &bytes::Bytes, pee
                 }
 
                 println!("Successfully handshaked with {}", addr);
-                let message = read_message(&mut stream).await?;
+                // match download_piece(&mut stream, file_content.info.piece_len, 0).await? {
+                //     Ok(piece_buf) => {println!("{:?}, piece_buf");}
+                //     // Err(e) => println!("{}", e),
+                // };
+
+                let downloaded_piece = download_piece(&mut stream, file_content.info.piece_len, 0).await.unwrap();
                 
+                println!("{:?}", downloaded_piece);
+
                 return Ok(stream);         
             }
             Ok(Err(e)) => {
