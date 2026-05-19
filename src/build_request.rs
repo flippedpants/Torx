@@ -137,8 +137,8 @@ pub fn build_http_url(file_content: &parser::Torrent, torrent_file: &Vec<u8>, pe
     const PORT: i32 = 6881;
 
     // let announce_url = find_https_tracker(&file_content.announce_list).unwrap();
-    let announce_url = "https://tracker.zhuqiy.com:443/announce".to_string(); 
-    // let announce_url = "https://tracker.yemekyedim.com:443/announce".to_string(); 
+    // let announce_url = file_content.announce.clone(); 
+    let announce_url = "https://tracker.yemekyedim.com:443/announce".to_string(); 
     
     let encoded_info_hash: String = hash_encoding(info_hash_hex.0);
     let peer_id = peer_id;

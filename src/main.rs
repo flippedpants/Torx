@@ -13,7 +13,7 @@ use crate::{connect_peer::{tcp_bitTorrent_handshake}, response::parse_response};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let torrent_file = fs::read("/home/daksh/Downloads/Black Myth - Wukong [FitGirl Repack].torrent").unwrap();
+    let torrent_file = fs::read("/home/daksh/Downloads/ubuntu-26.04-desktop-amd64.iso.torrent").unwrap();
 
     let file_content: Torrent = serde_bencode::from_bytes(&torrent_file).unwrap();
     
@@ -38,7 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tracker_response_body = response.bytes().await?;
     parse_response(&tracker_response_body);
 
-    let peer_id_bytes: [u8; 20] = generate_id().as_bytes().try_into().expect("Length Mismatch");
+    let peer_id_bytes: [u8; 20] = peer_id.as_bytes().try_into().expect("Length Mismatch");
     let info_hash_bytes = info_hash.1;
 
     match tcp_bitTorrent_handshake(&file_content, &tracker_response_body, peer_id_bytes, info_hash_bytes).await{

@@ -43,15 +43,14 @@ impl PeerMessage{
 
 pub async fn read_message(stream: &mut TcpStream) -> Result<PeerMessage, Box<dyn std::error::Error>>{
     let mut buf_length = [0u8; 4];
+    stream.read_exact(&mut buf_length).await?;
     let message_length = u32::from_be_bytes(buf_length);
 
     if message_length == 0 {
-        // println!("keep alive");
+        println!("keep alive");
         return Ok(PeerMessage::KeepAlive);
     }
 
-    stream.read_exact(&mut buf_length).await?;
-    let message_length = u32::from_be_bytes(buf_length);
     println!("Readed length bytes");
 
     let mut message = vec![0u8; message_length as usize];

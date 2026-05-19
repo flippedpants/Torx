@@ -66,10 +66,19 @@ pub async fn tcp_bitTorrent_handshake(file_content: &parser::Torrent,tracker_res
                 //     Ok(piece_buf) => {println!("{:?}, piece_buf");}
                 //     // Err(e) => println!("{}", e),
                 // };
+                stream.write_all(&[0,0,0,1,2]).await?;
+                println!("Sent interested");
+                let downloaded_piece = download_piece(&mut stream, file_content.info.piece_len, 0).await;
 
-                let downloaded_piece = download_piece(&mut stream, file_content.info.piece_len, 0).await.unwrap();
+                match &downloaded_piece{
+                    Ok(piece) => {println!("{:?}", piece)},
+                    Err(e) if e.to_string() == "unchoke timeout — try next peer" => {
+                        continue;
+                    }
+                    Err(e) => {println!("peer {} failed: {}", addr, e); continue;}
+                }
                 
-                println!("{:?}", downloaded_piece);
+                // println!("{:?}", &downloaded_piece);
 
                 return Ok(stream);         
             }
