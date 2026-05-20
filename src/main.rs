@@ -24,7 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let peer_id = generate_id();
 
-    split_pieces(&file_content.info.pieces);
+    let pieces_split = split_pieces(&file_content.info.pieces);
     println!("{:?}", calculate_torrent_size(&file_content));
     println!("{}", peer_id);
 
@@ -36,14 +36,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // println!("{:?}", response);
 
     let tracker_response_body = response.bytes().await?;
-    parse_response(&tracker_response_body);
+    // parse_response(&tracker_response_body);
 
     // println!("seeders: {:?}, leechers: {:?}", response.complete, response.incomplete);
 
     let peer_id_bytes: [u8; 20] = peer_id.as_bytes().try_into().expect("Length Mismatch");
     let info_hash_bytes = info_hash.1;
 
-    match tcp_bitTorrent_handshake(&file_content, &tracker_response_body, peer_id_bytes, info_hash_bytes).await{
+    match tcp_bitTorrent_handshake(&file_content, &tracker_response_body, peer_id_bytes, info_hash_bytes, pieces_split).await{
         Ok(s) => {
             println!("Connected and downloaded successfully!");
         }

@@ -7,6 +7,8 @@ use crate::parse_message::{PeerMessage, read_message};
 const BLOCK_SIZE: u32 = 16384;
 
 pub async fn download_piece(stream: &mut TcpStream, piece_length: u64, piece_index: u32)-> Result<Vec<u8>, Box<dyn std::error::Error>>{
+    stream.write_all(&[0,0,0,1,2]).await?;
+    println!("Sent interested");
     wait_for_unchoke(stream).await?;
 
     let num_blocks = ((piece_length as u32)+ BLOCK_SIZE -1 )/ BLOCK_SIZE;
@@ -40,7 +42,7 @@ pub async fn download_piece(stream: &mut TcpStream, piece_length: u64, piece_ind
 }
 
 pub async fn wait_for_unchoke(stream: &mut TcpStream) -> Result<(), Box<dyn std::error::Error>>{
-    let unchoke  = timeout(Duration::from_secs(120), async {
+    let unchoke  = timeout(Duration::from_secs(30), async {
     loop{
         match read_message(stream).await? {
             PeerMessage::Choke => {println!("got choke — continuing to wait"); continue;},
