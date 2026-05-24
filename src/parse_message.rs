@@ -1,4 +1,4 @@
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpStream};
+use tokio::{io::{AsyncReadExt}, net::TcpStream};
 
 #[derive(Debug)]
 pub enum PeerMessage{
@@ -47,7 +47,7 @@ pub async fn read_message(stream: &mut TcpStream) -> Result<PeerMessage, Box<dyn
     let message_length = u32::from_be_bytes(buf_length);
 
     if message_length == 0 {
-        println!("keep alive");
+        // println!("keep alive");
         return Ok(PeerMessage::KeepAlive);
     }
 

@@ -9,11 +9,11 @@ use std::fs::{self};
 use parser::Torrent;
 use build_request::{calculate_info_hash, split_pieces, calculate_torrent_size, generate_id, build_http_url};
 
-use crate::{connect_peer::{tcp_bitTorrent_handshake}, response::parse_response};
+use crate::{connect_peer::bit_torrent_handshake, download::download_piece, response::parse_response};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let torrent_file = fs::read("/home/daksh/Downloads/Resident Evil 7 - Biohazard [FitGirl Repack].torrent").unwrap();
+    let torrent_file = fs::read("/home/daksh/Downloads/ubuntu-26.04-desktop-amd64.iso.torrent").unwrap();
 
     let file_content: Torrent = serde_bencode::from_bytes(&torrent_file).unwrap();
     
@@ -43,13 +43,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let peer_id_bytes: [u8; 20] = peer_id.as_bytes().try_into().expect("Length Mismatch");
     let info_hash_bytes = info_hash.1;
 
-    match tcp_bitTorrent_handshake(&file_content, &tracker_response_body, peer_id_bytes, info_hash_bytes, pieces_split).await{
-        Ok(s) => {
-            println!("Connected and downloaded successfully!");
+    let peers = parse_response(&tracker_response_body);
+
+    let mut piece_index = 0;
+
+    let mut current_peer_index = 0;
+    while current_peer_index < peers.len(){
+        match bit_torrent_handshake(&peers[current_peer_index], peer_id_bytes, info_hash_bytes).await{
+            Ok(mut s) => {
+                match download_piece(&mut s, file_content.info.piece_len, piece_index).await {
+                    Ok(piece_buf) => {
+                        if piece_index as usize == pieces_split.len() - 1{
+                            println!("All pieces downloaded!");
+                            break;
+                        }
+                        else if piece_index as usize != pieces_split.len() - 1 && current_peer_index == peers.len() - 1{
+                            current_peer_index = 0;
+                        }
+
+                        println!("piece downloaded successfully");
+                        piece_index += 1;
+                        
+                    }
+                    Err(e) => {
+                        eprintln!("{}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Error: {}", e);
+            }
         }
-        Err(e) => {
-            eprintln!("Error: {}", e)
-        }
+        current_peer_index += 1;
     }
 
     Ok(())

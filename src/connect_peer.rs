@@ -1,6 +1,6 @@
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpStream, time::{timeout, Duration}};
 
-use crate::{download::download_piece, parser, response::parse_response};
+use crate::{download::download_piece, parser, response::{PeerAddress, parse_response}};
 
 #[derive(Debug)]
 pub struct Handshake{
@@ -27,79 +27,75 @@ impl Handshake{
     }
 }
 
-pub async fn tcp_bitTorrent_handshake(file_content: &parser::Torrent,tracker_response_bytes: &bytes::Bytes, peer_id: [u8; 20],info_hash_bytes: [u8; 20], pieces_split: Vec<[u8; 20]>) -> Result<TcpStream, Box<dyn std::error::Error>> {
-    let peers = parse_response(tracker_response_bytes);
+pub async fn bit_torrent_handshake(peer: &PeerAddress, peer_id: [u8; 20],info_hash_bytes: [u8; 20]) -> Result<TcpStream, Box<dyn std::error::Error>> {
+    
     let handshake = Handshake::new(info_hash_bytes, peer_id);
     // println!("{:?}", handshake);
     let req_bytes = handshake.serialize();
 
-    let mut piece_index = 0;
+    // println!("{:?}", peer);
+    let addr = format!("{}:{}", peer.ip, peer.port);
 
-    // while piece_index < pieces_split.len(){
-        for i in 0..peers.len() {
-            // println!("{:?}", peers[i]);
-            let addr = format!("{}:{}", peers[i].ip, peers[i].port);
+    let connection_attempt = TcpStream::connect(&addr);
 
-            let connection_attempt = TcpStream::connect(&addr);
+    match timeout(Duration::from_secs(3), connection_attempt).await {
+        Ok(Ok(mut stream)) => {
 
-            match timeout(Duration::from_secs(3), connection_attempt).await {
-                Ok(Ok(mut stream)) => {
-
-                    if let Err(e) = stream.write_all(&req_bytes).await {
-                        eprintln!("Failed to write handshake to {}: {}", addr, e);
-                        continue;
-                    }
-
-                    let mut handshake_res_buf = [0u8; 68];
-                    if let Err(e) = stream.read_exact(&mut handshake_res_buf).await {
-                        eprintln!("Failed to read handshake from {}: {}", addr, e);
-                        continue;
-                    }
-
-
-                    if handshake_res_buf[0] != 19 || &handshake_res_buf[1..=19] != b"BitTorrent protocol" {
-                        eprintln!("Invalid protocol response from {}", addr);
-                        continue;
-                    }
-
-                    if &handshake_res_buf[28..48] != &info_hash_bytes {
-                        eprintln!("Info hash mismatch with peer {}", addr);
-                        continue;
-                    }
-
-                    println!("Successfully handshaked with {}", addr);
-                    // match download_piece(&mut stream, file_content.info.piece_len, 0).await? {
-                    //     Ok(piece_buf) => {println!("{:?}, piece_buf");}
-                    //     // Err(e) => println!("{}", e),
-                    // };
-
-                    let downloaded_piece = download_piece(&mut stream, file_content.info.piece_len, piece_index as u32).await;
-
-                    match &downloaded_piece{
-                        Ok(piece) => {println!("{:?}", piece)},
-                        Err(e) if e.to_string() == "unchoke timeout — try next peer" => {
-                            continue;
-                        }
-                        Err(e) => {println!("peer {} failed: {}", addr, e); continue;}
-                    }
-
-                    // piece_index += 1;
-                    
-                    // println!("{:?}", &downloaded_piece);
-
-                    return Ok(stream);         
-                }
-                Ok(Err(e)) => {
-                    eprintln!("Connection failed to {}: {}", addr, e);
-                }
-                Err(_) => {
-                    eprintln!("Connection to {} timed out", addr);
-                }
+            if let Err(e) = stream.write_all(&req_bytes).await {
+                eprintln!("Failed to write handshake to {}: {}", addr, e);
+                return Err(e.into());
             }
-            
 
+            let mut handshake_res_buf = [0u8; 68];
+            if let Err(e) = stream.read_exact(&mut handshake_res_buf).await {
+                eprintln!("Failed to read handshake from {}: {}", addr, e);
+                return Err(e.into());
+            }
+
+
+            if handshake_res_buf[0] != 19 || &handshake_res_buf[1..=19] != b"BitTorrent protocol" {
+                let e = format!("Invalid protocol response from {}", addr);
+                return Err(e.into());
+            }
+
+            if &handshake_res_buf[28..48] != &info_hash_bytes {
+                let e = format!("Info hash mismatch with peer {}", addr);
+                return Err(e.into());
+            }
+
+            println!("Successfully handshaked with {}", addr);
+            // match download_piece(&mut stream, file_content.info.piece_len, 0).await? {
+            //     Ok(piece_buf) => {println!("{:?}, piece_buf");}
+            //     // Err(e) => println!("{}", e),
+            // };
+
+            // let downloaded_piece = download_piece(&mut stream, file_content.info.piece_len, piece_index as u32).await;
+
+            // match &downloaded_piece{
+            //     Ok(piece) => {println!("{:?}", piece)},
+            //     Err(e) if e.to_string() == "unchoke timeout — try next peer" => {
+            //         continue;
+            //     }
+            //     Err(e) => {println!("peer {} failed: {}", addr, e); continue;}
+            // }
+
+            // piece_index += 1;
+            
+            // println!("{:?}", &downloaded_piece);
+
+            return Ok(stream);   
         }
+        Ok(Err(e)) => {
+            eprintln!("Connection failed to {}: {}", addr, e);
+            return Err(e.into());
+        }
+        Err(e) => {
+            eprintln!("Connection to {} timed out", addr);
+            return Err(e.into());
+        }
+    }
+            
     // }
 
-    Err("No valid peer found among the list".into())
+    // Err("No valid peer found among the list".into())
 }
