@@ -1,15 +1,15 @@
 mod parser;
 mod build_request;
 mod response;
-mod connect_peer;
-mod parse_message;
+mod peer;
 mod download;
+mod piece;
 
 use std::fs::{self};
 use parser::Torrent;
 use build_request::{calculate_info_hash, split_pieces, calculate_torrent_size, generate_id, build_http_url};
 
-use crate::{connect_peer::bit_torrent_handshake, download::download_piece, response::parse_response};
+use crate::{peer::bit_torrent_handshake, download::download_piece, response::parse_response};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -48,6 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut piece_index = 0;
 
     let mut current_peer_index = 0;
+    
     while current_peer_index < peers.len(){
         match bit_torrent_handshake(&peers[current_peer_index], peer_id_bytes, info_hash_bytes).await{
             Ok(mut s) => {
@@ -60,6 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         else if piece_index as usize != pieces_split.len() - 1 && current_peer_index == peers.len() - 1{
                             current_peer_index = 0;
                         }
+                        
 
                         println!("piece downloaded successfully");
                         piece_index += 1;

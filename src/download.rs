@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use tokio::{io::AsyncWriteExt, net::TcpStream, time::timeout};
 
-use crate::parse_message::{PeerMessage, read_message};
+use crate::peer::{PeerMessage, read_message};
 
 const BLOCK_SIZE: u32 = 16384;
 
@@ -36,8 +36,7 @@ pub async fn download_piece(stream: &mut TcpStream, piece_length: u64, piece_ind
         };
     }
 
-    Ok(piece_buf)
-        
+    Ok(piece_buf)        
     
 }
 
