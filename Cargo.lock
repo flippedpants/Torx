@@ -1474,6 +1474,7 @@ dependencies = [
  "serde_bytes",
  "sha1",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

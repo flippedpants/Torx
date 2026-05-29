@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet};
+
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpStream, time::{timeout, Duration}};
 
 use crate::response::{PeerAddress};
@@ -137,6 +139,51 @@ pub async fn bit_torrent_handshake(peer: &PeerAddress, peer_id: [u8; 20],info_ha
         Err(e) => {
             eprintln!("Connection to {} timed out", addr);
             return Err(e.into());
+        }
+    }
+}
+
+pub struct PeerRegistry{
+    peers: HashMap<String, HashSet<u32>>,
+    num_pieces: u32,
+    piece_availability: Vec<u32>,
+}
+
+impl PeerRegistry{
+    pub fn new(num_pieces: u32) -> Self{
+        PeerRegistry { peers: HashMap::new(), num_pieces, piece_availability: vec![0; num_pieces as usize] }
+    }
+
+    pub fn set_bitfield(&mut self, peer_addr: &String, bitfield: &[u8]){
+        let pieces: HashSet<u32> = bitfield
+            .iter()
+            .enumerate()
+            .flat_map(|(byte_i, byte)| {
+                (0..8).rev().filter_map(move |bit_i| {
+                    if byte & (1 << bit_i) != 0 {
+                        Some((byte_i * 8 + (7 - bit_i)) as u32)
+                    } else {
+                        None
+                    }
+                })
+            })
+            .filter(|&i| i < self.num_pieces)
+            .collect();
+
+        for &piece in &pieces{
+            self.piece_availability[piece as usize] += 1;
+        }
+
+        self.peers.insert(peer_addr.to_string(), pieces);
+    }
+
+    pub fn set_have(&mut self, peer_addr: &String, piece_index: u32){
+        let entry = self.peers
+            .entry(peer_addr.to_string())
+            .or_insert_with(HashSet::new);
+
+        if entry.insert(piece_index) {
+            self.piece_availability[piece_index as usize] += 1;
         }
     }
 }

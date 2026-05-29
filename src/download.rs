@@ -1,10 +1,18 @@
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use std::time::Duration;
-
 use tokio::{io::AsyncWriteExt, net::TcpStream, time::timeout};
+use tokio_util::sync::CancellationToken;
 
-use crate::peer::{PeerMessage, read_message};
+use crate::{peer::{PeerMessage, bit_torrent_handshake, read_message}, piece::PieceState, response::PeerAddress};
 
 const BLOCK_SIZE: u32 = 16384;
+
+pub async fn peer_task(peer: &PeerAddress,peer_id: [u8; 20],info_hash_bytes: [u8; 20], state: Arc<Mutex<PieceState>>, token: CancellationToken){
+    let Ok(mut stream) = bit_torrent_handshake(peer, peer_id, info_hash_bytes).await else {return;};
+
+    let peer_has: Vec<bool> = vec![];
+}
 
 pub async fn download_piece(stream: &mut TcpStream, piece_length: u64, piece_index: u32)-> Result<Vec<u8>, Box<dyn std::error::Error>>{
     stream.write_all(&[0,0,0,1,2]).await?;
