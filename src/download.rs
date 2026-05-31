@@ -4,9 +4,9 @@ use std::time::Duration;
 use tokio::{io::AsyncWriteExt, net::TcpStream, time::timeout};
 use tokio_util::sync::CancellationToken;
 
-use crate::{peer::{PeerMessage, bit_torrent_handshake, read_message}, piece::PieceState, response::PeerAddress};
+use crate::{peer::{PeerMessage, bit_torrent_handshake, read_message}, response::PeerAddress};
 
-const BLOCK_SIZE: u32 = 16384;
+pub const BLOCK_SIZE: u32 = 16384;
 
 pub struct DownloadState {
     pub needed: Vec<bool>,
