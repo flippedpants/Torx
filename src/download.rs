@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 use tokio::sync::Mutex;
 use std::time::Duration;
 use tokio::{io::AsyncWriteExt, net::TcpStream, time::timeout};
@@ -8,11 +8,36 @@ use crate::{peer::{PeerMessage, bit_torrent_handshake, read_message}, piece::Pie
 
 const BLOCK_SIZE: u32 = 16384;
 
-pub async fn peer_task(peer: &PeerAddress,peer_id: [u8; 20],info_hash_bytes: [u8; 20], state: Arc<Mutex<PieceState>>, token: CancellationToken){
-    let Ok(mut stream) = bit_torrent_handshake(peer, peer_id, info_hash_bytes).await else {return;};
+pub struct DownloadState {
+    pub needed: Vec<bool>,
+    pub in_progress: HashSet<u32>,
+    pub num_pieces: u32
+}   
 
-    let peer_has: Vec<bool> = vec![];
-}
+impl DownloadState {
+    pub fn new(num_pieces: u32) -> Self{
+        DownloadState{
+            needed: vec![true; num_pieces as usize],
+            in_progress: HashSet::new(),
+            num_pieces
+        }
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.needed.iter().all(|x| !x)
+    }
+
+    pub fn mark_done(&mut self, piece_index: u32){
+        self.needed[piece_index as usize] = false;
+        self.in_progress.remove(&piece_index);
+    }
+
+    pub fn mark_failed(&mut self, piece_index: u32){
+        self.needed[piece_index as usize] = true;
+        self.in_progress.insert(piece_index);
+    }
+}   
+
 
 pub async fn download_piece(stream: &mut TcpStream, piece_length: u64, piece_index: u32)-> Result<Vec<u8>, Box<dyn std::error::Error>>{
     stream.write_all(&[0,0,0,1,2]).await?;

@@ -186,4 +186,26 @@ impl PeerRegistry{
             self.piece_availability[piece_index as usize] += 1;
         }
     }
+
+    pub fn peer_has(&self, peer_adr: &String, piece_index: u32) -> bool {
+        self.peers.get(peer_adr)
+            .map(|pieces| pieces.contains(&piece_index))
+            .unwrap_or(false)
+    }
+
+    pub fn peers_with_pieces(&self, piece_index: u32) -> Vec<String>{
+        self.peers.iter()
+            .filter(|(_, pieces)| pieces.contains(&piece_index))
+            .map(|(addr, _)| addr.clone())
+            .collect()
+    }
+
+    pub fn rarest_piece_for_peer(&self, peer_addr: &String, needed: &[bool]) -> Option<u32> {
+        let peer_pieces = self.peers.get(peer_addr)?;
+
+        peer_pieces.iter()
+            .filter(|&&i| needed.get(i as usize).copied().unwrap_or(false))
+            .min_by_key(|&&i| self.piece_availability[i as usize])
+            .copied()
+    }
 }
