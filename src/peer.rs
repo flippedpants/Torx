@@ -13,8 +13,8 @@ pub enum PeerMessage{
     NotInterested,
     Have (u32),
     Bitfield (Vec<u8>),
-    Request { index: u32, begin: u32, length: u32},
-    Piece {index: u32, begin: u32, data: Vec<u8>},
+    Request { index: u32, begin: u64, length: u32},
+    Piece {index: u32, begin: u64, data: Vec<u8>},
     Cancel
 }
 
@@ -29,12 +29,12 @@ impl PeerMessage{
             5 => Ok(Self::Bitfield(payload.to_vec())),
             6 => Ok(Self::Request {
                 index: u32::from_be_bytes(payload[..4].try_into()?),
-                begin: u32::from_be_bytes(payload[4..8].try_into()?),
+                begin: u64::from_be_bytes(payload[4..8].try_into()?),
                 length: u32::from_be_bytes(payload[8..12].try_into()?)
             }),
             7 => Ok(Self::Piece{
                 index: u32::from_be_bytes(payload[..4].try_into()?),
-                begin: u32::from_be_bytes(payload[4..8].try_into()?),
+                begin: u64::from_be_bytes(payload[4..8].try_into()?),
                 data: payload[8..].to_vec(),
             }),
             8 => Ok(Self::Cancel),

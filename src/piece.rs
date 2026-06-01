@@ -29,12 +29,12 @@ use crate::download::BLOCK_SIZE;
 pub struct PieceBuf{
     pub data: Vec<u8>,
     pub recv_blocks:  Vec<bool>,
-    pub recv: u32,
-    pub num_blocks: u32
+    pub recv: u64,
+    pub num_blocks: u64
 }
 
 impl PieceBuf{
-    pub fn new(piece_len: u32) -> Self{
+    pub fn new(piece_len: u64) -> Self{
         let num_blocks = (piece_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
         PieceBuf { data: vec![0u8; piece_len as usize], recv_blocks: vec![false; num_blocks as usize], recv: 0, num_blocks }
     }
@@ -52,7 +52,7 @@ impl PieceBuf{
             .collect()
     }
 
-    pub fn add_block(&mut self, begin: u32, data: &[u8]){
+    pub fn add_block(&mut self, begin: u64, data: &[u8]){
         let block_index = begin / BLOCK_SIZE;
         if !self.recv_blocks[block_index as usize] {
             self.data[begin as usize..begin as usize + data.len()].copy_from_slice(data);
