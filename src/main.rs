@@ -9,7 +9,7 @@ use std::fs::{self};
 use parser::Torrent;
 use build_request::{calculate_info_hash, split_pieces, calculate_torrent_size, generate_id, build_http_url};
 
-use crate::{peer::bit_torrent_handshake, download::download_piece, response::parse_response};
+use crate::{download::bit_torrent_handshake, download::download_piece, response::parse_response};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
