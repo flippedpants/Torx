@@ -23,6 +23,7 @@
 //     }
 // }
 
+use sha1::{Sha1, Digest};
 use crate::download::BLOCK_SIZE;
 
 //Temporary piece buf (lives during download)
@@ -60,4 +61,10 @@ impl PieceBuf{
             self.recv += 1;
         }
     }
+}
+
+pub fn verify_piece(received_piece: &[u8], expected_hash: [u8; 20]) -> bool {
+    let mut hasher = Sha1::new();
+    hasher.update(received_piece);
+    hasher.finalize().as_slice() == expected_hash
 }

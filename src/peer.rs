@@ -1,6 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::{collections::{HashMap, HashSet}, sync::Arc};
 
-use tokio::{io::AsyncReadExt, net::TcpStream};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpStream, sync::Mutex};
+use tokio_util::sync::CancellationToken;
+
+use crate::{download::{DownloadState, wait_for_unchoke}, peer};
 
 #[derive(Debug)]
 pub enum PeerMessage{
@@ -40,30 +43,6 @@ impl PeerMessage{
 
         }
     }
-}
-
-
-pub async fn read_message(stream: &mut TcpStream) -> Result<PeerMessage, Box<dyn std::error::Error>>{
-    let mut buf_length = [0u8; 4];
-    stream.read_exact(&mut buf_length).await?;
-    let message_length = u32::from_be_bytes(buf_length);
-
-    if message_length == 0 {
-        // println!("keep alive");
-        return Ok(PeerMessage::KeepAlive);
-    }
-
-    println!("Readed length bytes");
-
-    let mut message = vec![0u8; message_length as usize];
-    stream.read_exact(&mut message).await?;
-    println!("Readed message");
-
-    let id = message[0];
-    println!("{:?}", PeerMessage::parse_peer_message(&id, &message[1..]));
-    PeerMessage::parse_peer_message(&id, &message[1..])
-
-    // Ok()
 }
 
 pub struct PeerRegistry{
@@ -123,12 +102,118 @@ impl PeerRegistry{
             .collect()
     }
 
-    pub fn rarest_piece_for_peer(&self, peer_addr: &String, needed: &[bool]) -> Option<u32> {
+    pub fn rarest_piece_for_peer(&self, peer_addr: &String, needed: &[bool], in_progress: &HashSet<u32>) -> Option<u32> {
         let peer_pieces = self.peers.get(peer_addr)?;
 
         peer_pieces.iter()
-            .filter(|&&i| needed.get(i as usize).copied().unwrap_or(false))
+            .filter(|&&i| needed.get(i as usize).copied().unwrap_or(false) && !in_progress.contains(&i))
             .min_by_key(|&&i| self.piece_availability[i as usize])
             .copied()
+    }
+}
+
+pub async fn read_message(stream: &mut TcpStream) -> Result<PeerMessage, Box<dyn std::error::Error>>{
+    let mut buf_length = [0u8; 4];
+    stream.read_exact(&mut buf_length).await?;
+    let message_length = u32::from_be_bytes(buf_length);
+
+    if message_length == 0 {
+        // println!("keep alive");
+        return Ok(PeerMessage::KeepAlive);
+    }
+
+    println!("Readed length bytes");
+
+    let mut message = vec![0u8; message_length as usize];
+    stream.read_exact(&mut message).await?;
+    println!("Readed message");
+
+    let id = message[0];
+    println!("{:?}", PeerMessage::parse_peer_message(&id, &message[1..]));
+    PeerMessage::parse_peer_message(&id, &message[1..])
+
+    // Ok()
+}
+
+pub async fn peer_task(
+    peer_addr: &String,
+    stream: &mut TcpStream,
+    registry: Arc<Mutex<PeerRegistry>>,
+    dl_state: Arc<Mutex<DownloadState>>,
+    token: &CancellationToken
+){
+    println!("[{}] - task started", peer_addr);
+
+    loop{
+        tokio::select! {
+            _ = token.cancelled() => {
+                println!("Task cancelled mid init");
+                return;
+            },
+            msg = read_message(stream) => {
+                match msg {
+                    Ok(PeerMessage::Bitfield(b)) => {
+                        let mut reg = registry.lock().await;
+                        reg.set_bitfield(peer_addr, &b);
+                        break;
+                    }
+                    Ok(PeerMessage::Have(i)) => {
+                        let mut reg = registry.lock().await;
+                        reg.set_have(peer_addr, i);
+                    }
+                    Ok(PeerMessage::Unchoke) =>{
+                        println!("Got Unchoke without Bitfield - {}", peer_addr);
+                        break;
+                    }
+                    Ok(_) => continue,
+                    Err(e) => {
+                        eprintln!("[{}] error during init - {}", peer_addr, e);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if stream.write_all(&[0,0,0,1,2]).await.is_err() {
+        eprintln!("Could not sent interested to [{}] ", peer_addr);
+        return;
+    }
+
+    tokio::select! {
+        _ = token.cancelled() => {
+            println!("Cancelled while waiting for unchoke - [{}]", peer_addr);
+            return;
+        }
+        result = wait_for_unchoke(stream) => {
+            if result.is_err() {
+                eprintln!("[{}] - unchoke timeout", peer_addr);
+                return;
+            }
+        }
+    }
+
+    println!("Starting Download for - [{}]", peer_addr);
+
+    loop {
+        if token.is_cancelled() {
+            return;
+        }
+
+        let piece_index = {
+            let reg = registry.lock().await;
+            let state = dl_state.lock().await;
+            reg.rarest_piece_for_peer(peer_addr, &state.needed, &state.in_progress)
+        };
+
+        let Some(piece_index) = piece_index else{
+            println!("[{}] no more pieces to download", peer_addr);
+            return;
+        };
+
+        {
+            let mut state = dl_state.lock().await;
+            state.in_progress.insert(piece_index);
+        }
     }
 }
