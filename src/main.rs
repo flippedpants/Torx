@@ -47,38 +47,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut piece_index = 0;
 
-    let mut current_peer_index = 0;
-    
-    while current_peer_index < peers.len(){
-        match bit_torrent_handshake(&peers[current_peer_index], peer_id_bytes, info_hash_bytes).await{
-            Ok(mut s) => {
-                match download_piece(&mut s, file_content.info.piece_len, piece_index).await {
-                    Ok(piece_buf) => {
-                        if piece_index as usize == pieces_split.len() - 1{
-                            println!("All pieces downloaded!");
-                            break;
-                        }
-                        else if piece_index as usize != pieces_split.len() - 1 && current_peer_index == peers.len() - 1{
-                            current_peer_index = 0;
-                        }
-                        
-
-                        println!("piece downloaded successfully");
-                        piece_index += 1;
-                        
-                    }
-                    Err(e) => {
-                        eprintln!("{}", e);
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("Error: {}", e);
-            }
-        }
-        current_peer_index += 1;
-    }
-
     Ok(())
 
 }

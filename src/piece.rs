@@ -63,7 +63,7 @@ impl PieceBuf{
     }
 }
 
-pub fn verify_piece(received_piece: &[u8], expected_hash: [u8; 20]) -> bool {
+pub fn verify_piece(received_piece: &[u8], expected_hash: &[u8; 20]) -> bool {
     let mut hasher = Sha1::new();
     hasher.update(received_piece);
     hasher.finalize().as_slice() == expected_hash

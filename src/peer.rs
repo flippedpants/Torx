@@ -1,9 +1,9 @@
 use std::{collections::{HashMap, HashSet}, sync::Arc};
 
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpStream, sync::Mutex};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt, AsyncSeekExt}, net::TcpStream, sync::Mutex, fs::File};
 use tokio_util::sync::CancellationToken;
 
-use crate::{download::{DownloadState, wait_for_unchoke}, peer};
+use crate::{download::{DownloadState, download_piece, wait_for_unchoke}, peer, piece::verify_piece};
 
 #[derive(Debug)]
 pub enum PeerMessage{
@@ -140,7 +140,12 @@ pub async fn peer_task(
     stream: &mut TcpStream,
     registry: Arc<Mutex<PeerRegistry>>,
     dl_state: Arc<Mutex<DownloadState>>,
-    token: &CancellationToken
+    token: &CancellationToken,
+    standard_piece_length: u64,
+    total_length: u64,
+    num_pieces: u32,
+    piece_hashes: Arc<Vec<[u8; 20]>>,
+    file: Arc<Mutex<File>>
 ){
     println!("[{}] - task started", peer_addr);
 
@@ -215,5 +220,63 @@ pub async fn peer_task(
             let mut state = dl_state.lock().await;
             state.in_progress.insert(piece_index);
         }
+
+        let piece_length = if piece_index == num_pieces - 1 {
+            (total_length - (standard_piece_length* (num_pieces as u64 - 1)))
+        } else {
+            standard_piece_length
+        };
+
+        match download_piece(stream, peer_addr, piece_length, piece_index, token).await {
+            Ok(piece_buf) => {
+                if !verify_piece(&piece_buf.data, &piece_hashes[piece_index as usize]){
+                    eprintln!("Piece mismatch, discarding piece");
+                    {
+                        let mut state = dl_state.lock().await;
+                        state.mark_failed(piece_index);
+                        return;
+                    }
+                }
+
+                println!("[{}] piece verified - {}", peer_addr, piece_index);
+
+                let offset = piece_index as u64 * piece_length;
+                {
+                    let mut f = file.lock().await;
+                    if f.seek(std::io::SeekFrom::Start(offset)).await.is_err() || f.write_all(&piece_buf.data).await.is_err(){
+                        eprintln!("[{}] failed to write piece {}", peer_addr, piece_index);
+                        let mut state = dl_state.lock().await;
+                        state.mark_failed(piece_index);
+                        return;
+                    }
+                }
+
+                {
+                    let mut state = dl_state.lock().await;
+                    state.mark_done(piece_index);
+                    println!(
+                        "[{}] piece {} done — {}/{} complete",
+                        peer_addr,
+                        piece_index,
+                        state.needed.iter().filter(|&&n| !n).count(),
+                        num_pieces
+                    );
+
+                    if state.is_complete() {
+                        println!("all pieces downloaded!");
+                        token.cancel(); // stop all other peer tasks
+                        return;
+                    }
+                }
+            }
+
+            Err(e) => {
+                eprintln!("[{}] piece {} failed: {}", peer_addr, piece_index, e);
+                let mut state = dl_state.lock().await;
+                state.mark_failed(piece_index);
+                return;
+            }
+        }
+
     }
 }
