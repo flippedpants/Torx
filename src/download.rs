@@ -215,7 +215,7 @@ pub async fn run_download(
     total_length: u64,
     num_pieces: u32,
     piece_hashes: Arc<Vec<[u8; 20]>>,
-    output_dir: &str
+    output_dir: &String
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
 
     let file = tokio::fs::OpenOptions::new()

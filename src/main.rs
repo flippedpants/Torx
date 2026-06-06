@@ -14,7 +14,7 @@ use crate::{download::{DownloadState, bit_torrent_handshake, download_piece, run
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-    let torrent_file = fs::read("/home/daksh/Downloads/ubuntu-26.04-desktop-amd64.iso.torrent").unwrap();
+    let torrent_file = fs::read("/home/daksh/Downloads/big-buck-bunny.torrent").unwrap();
 
     let file_content: Torrent = serde_bencode::from_bytes(&torrent_file).unwrap();
     
@@ -70,11 +70,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
     let registry = Arc::new(Mutex::new(PeerRegistry::new(num_pieces)));
     let dl_state = Arc::new(Mutex::new(DownloadState::new(num_pieces)));
     let arc_piece_hashes = Arc::new(piece_hashes);
-    let output_dir = "/home/daksh/Downloads/";
+    let single_file_name = file_content.info.name;
+    let output_dir = format!("/home/daksh/Downloads/{}", single_file_name);
 
     println!("got required data");
 
-    run_download(handshaked_peers, registry, dl_state, standard_piece_length, total_length, num_pieces, arc_piece_hashes, output_dir).await?;
+    run_download(handshaked_peers, registry, dl_state, standard_piece_length, total_length, num_pieces, arc_piece_hashes, &output_dir).await?;
 
     Ok(())
 
