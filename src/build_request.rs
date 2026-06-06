@@ -101,7 +101,7 @@ pub fn split_pieces(concat_pieces: &Vec<u8>) -> Vec<[u8; 20]> {
     pieces
 }
 
-pub fn calculate_torrent_size(file_content: &parser::Torrent) -> u64{
+pub fn calculate_torrent_size(file_content: &parser::Torrent) -> (u64, u32){
     let mut total_length = 0;
 
     match &file_content.info.mode{
@@ -117,9 +117,9 @@ pub fn calculate_torrent_size(file_content: &parser::Torrent) -> u64{
 
     let piece_length = &file_content.info.piece_len;
 
-    let piece_count = total_length.div_ceil(*piece_length);
+    let piece_count = total_length.div_ceil(*piece_length) as u32;
 
-    total_length
+    (total_length, piece_count)
 }
 
 pub fn generate_id() -> String{
@@ -138,7 +138,7 @@ pub fn build_http_url(file_content: &parser::Torrent, torrent_file: &Vec<u8>, pe
 
     // let announce_url = find_https_tracker(&file_content.announce_list).unwrap();
     // let announce_url = file_content.announce.clone(); 
-    let announce_url = "https://tracker.yemekyedim.com:443/announce".to_string(); 
+    let announce_url = "https://tracker.zhuqiy.com:443/announce".to_string(); 
     
     let encoded_info_hash: String = hash_encoding(info_hash_hex.0);
     let peer_id = peer_id;
@@ -147,7 +147,7 @@ pub fn build_http_url(file_content: &parser::Torrent, torrent_file: &Vec<u8>, pe
     let downloading_left = calculate_torrent_size(file_content);
     let compact = 1;
     
-    let url = format!("{}?info_hash={}&peer_id={}&port={}&uploaded={}&downloaded={}&left={}&compact={}",
+    let url = format!("{}?info_hash={}&peer_id={}&port={}&uploaded={}&downloaded={}&left={:?}&compact={}",
                                 announce_url,encoded_info_hash,peer_id,PORT,uploaded,downloaded,downloading_left,compact);
 
     println!("{}", url);

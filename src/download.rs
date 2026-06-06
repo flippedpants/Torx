@@ -1,10 +1,10 @@
-use std::{collections::HashSet, ops::ControlFlow::Continue, sync::Arc};
+use std::{collections::HashSet, sync::Arc};
 use tokio::sync::Mutex;
 use std::time::Duration;
 use tokio::{io::{AsyncWriteExt, AsyncReadExt}, net::TcpStream, time::timeout};
 use tokio_util::sync::CancellationToken;
 
-use crate::{peer::{PeerMessage, read_message}, piece::PieceBuf, response::PeerAddress};
+use crate::{peer::{PeerMessage, PeerRegistry, peer_task, read_message}, piece::PieceBuf, response::PeerAddress};
 
 pub const BLOCK_SIZE: u64 = 16384;
 
@@ -63,7 +63,7 @@ impl DownloadState {
     }
 }   
 
-pub async fn bit_torrent_handshake(peer: &PeerAddress, peer_id: [u8; 20],info_hash_bytes: [u8; 20]) -> Result<TcpStream, Box<dyn std::error::Error>> {
+pub async fn bit_torrent_handshake(peer: &PeerAddress, peer_id: [u8; 20],info_hash_bytes: [u8; 20]) -> Result<TcpStream, Box<dyn std::error::Error + Send + Sync + 'static>> {
     
     let handshake = Handshake::new(info_hash_bytes, peer_id);
     // println!("{:?}", handshake);
@@ -90,13 +90,11 @@ pub async fn bit_torrent_handshake(peer: &PeerAddress, peer_id: [u8; 20],info_ha
 
 
             if handshake_res_buf[0] != 19 || &handshake_res_buf[1..=19] != b"BitTorrent protocol" {
-                let e = format!("Invalid protocol response from {}", addr);
-                return Err(e.into());
+                return Err(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Invalid protocol response from {}", addr))));
             }
 
             if &handshake_res_buf[28..48] != &info_hash_bytes {
-                let e = format!("Info hash mismatch with peer {}", addr);
-                return Err(e.into());
+                return Err(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Info hash mismatch with peer {}", addr))));
             }
 
             println!("Successfully handshaked with {}", addr);
@@ -113,7 +111,7 @@ pub async fn bit_torrent_handshake(peer: &PeerAddress, peer_id: [u8; 20],info_ha
     }
 }
 
-pub async fn download_piece(stream: &mut TcpStream,peer_addr: &String, piece_length: u64, piece_index: u32, token: &CancellationToken)-> Result<PieceBuf, Box<dyn std::error::Error>>{
+pub async fn download_piece(stream: &mut TcpStream,peer_addr: &String, piece_length: u64, piece_index: u32, token: &CancellationToken)-> Result<PieceBuf, Box<dyn std::error::Error + Send + Sync + 'static>> {
 
     let num_blocks = (piece_length + BLOCK_SIZE -1 )/ BLOCK_SIZE;
     let mut buf = PieceBuf::new(piece_length );
@@ -122,11 +120,11 @@ pub async fn download_piece(stream: &mut TcpStream,peer_addr: &String, piece_len
 
     loop {
         if token.is_cancelled() {
-            return Err("cancelled".into());
+            return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "cancelled")));
         }
 
         tokio::select! {
-            _ = token.cancelled() => return Err("Cancelled".into()),
+            _ = token.cancelled() => return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "Cancelled"))),
             msg = read_message(stream) => {
                 match msg? {
                     PeerMessage::Piece {index, begin, data} => {
@@ -154,7 +152,7 @@ pub async fn download_piece(stream: &mut TcpStream,peer_addr: &String, piece_len
     }    
 }
 
-pub async fn wait_for_unchoke(stream: &mut TcpStream) -> Result<(), Box<dyn std::error::Error>>{
+pub async fn wait_for_unchoke(stream: &mut TcpStream) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>>{
     let unchoke  = timeout(Duration::from_secs(30), async {
     loop{
         match read_message(stream).await? {
@@ -175,17 +173,17 @@ pub async fn wait_for_unchoke(stream: &mut TcpStream) -> Result<(), Box<dyn std:
     }
 
     #[allow(unreachable_code)]
-    Ok::<(), Box<dyn std::error::Error>>(())
+    Ok::<(), Box<dyn std::error::Error + Send + Sync + 'static>>(() )
 
     }).await;
 
     match unchoke{
         Ok(Ok(())) => Ok(()),
-        _ => Err("unchoke timeout".into())
+        _ => Err(Box::new(std::io::Error::new(std::io::ErrorKind::TimedOut, "unchoke timeout")))
     }
 }
 
-pub async fn request_blocks(stream: &mut TcpStream, piece_length: u64, piece_index: u32,num_blocks: u64, received_blocks: &[bool]) -> Result<(), Box<dyn std::error::Error>>{
+pub async fn request_blocks(stream: &mut TcpStream, piece_length: u64, piece_index: u32,num_blocks: u64, received_blocks: &[bool]) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>>{
 
     for i in 0..num_blocks {
         if received_blocks[i as usize] {
@@ -206,5 +204,58 @@ pub async fn request_blocks(stream: &mut TcpStream, piece_length: u64, piece_ind
     }
     
     println!("Sent request");
+    Ok(())
+}
+
+pub async fn run_download(
+    peers: Vec<(String, TcpStream)>,
+    registry: Arc<Mutex<PeerRegistry>>,
+    dl_state: Arc<Mutex<DownloadState>>,
+    standard_piece_length: u64,
+    total_length: u64,
+    num_pieces: u32,
+    piece_hashes: Arc<Vec<[u8; 20]>>,
+    output_dir: &str
+) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+
+    let file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .open(output_dir)
+        .await?;
+
+    file.set_len(total_length).await?;
+        let file = Arc::new(Mutex::new(file));
+        let mut handles: Vec<tokio::task::JoinHandle<()>> = vec![];
+        let token = CancellationToken::new();
+
+    for (peer_addr, stream) in peers {
+            let registry_clone = Arc::clone(&registry);
+            let dl_state_clone = Arc::clone(&dl_state);
+            let hashes_clone = Arc::clone(&piece_hashes);
+            let file_clone = Arc::clone(&file);
+            let token_clone = token.clone(); 
+
+            let handle = tokio::spawn(
+                peer_task(
+                    peer_addr,
+                    stream, // Move the stream directly into the thread
+                    registry_clone,
+                    dl_state_clone,
+                    token_clone,
+                    standard_piece_length,
+                    total_length,
+                    num_pieces,
+                    hashes_clone,
+                    file_clone,
+                )
+            );
+            handles.push(handle);
+        }
+
+        for handle in handles{
+            handle.await;
+        }
+
     Ok(())
 }

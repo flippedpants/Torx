@@ -20,7 +20,7 @@ pub enum PeerMessage{
 }
 
 impl PeerMessage{
-    pub fn parse_peer_message(id: &u8, payload: &[u8]) -> Result<Self, Box<dyn std::error::Error>>{
+    pub fn parse_peer_message(id: &u8, payload: &[u8]) -> Result<Self, Box<dyn std::error::Error + Send + Sync + 'static>>{
         match id {
             0 => Ok(Self::Choke),
             1 => Ok(Self::Unchoke),
@@ -39,7 +39,7 @@ impl PeerMessage{
                 data: payload[8..].to_vec(),
             }),
             8 => Ok(Self::Cancel),
-            _ => Err("Invalid message id!".into())
+            _ => Err(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid message id!")))
 
         }
     }
@@ -112,7 +112,7 @@ impl PeerRegistry{
     }
 }
 
-pub async fn read_message(stream: &mut TcpStream) -> Result<PeerMessage, Box<dyn std::error::Error>>{
+pub async fn read_message(stream: &mut TcpStream) -> Result<PeerMessage, Box<dyn std::error::Error + Send + Sync + 'static>>{
     let mut buf_length = [0u8; 4];
     stream.read_exact(&mut buf_length).await?;
     let message_length = u32::from_be_bytes(buf_length);
@@ -136,11 +136,11 @@ pub async fn read_message(stream: &mut TcpStream) -> Result<PeerMessage, Box<dyn
 }
 
 pub async fn peer_task(
-    peer_addr: &String,
-    stream: &mut TcpStream,
+    peer_addr: String,
+    mut stream: TcpStream,
     registry: Arc<Mutex<PeerRegistry>>,
     dl_state: Arc<Mutex<DownloadState>>,
-    token: &CancellationToken,
+    token: CancellationToken,
     standard_piece_length: u64,
     total_length: u64,
     num_pieces: u32,
@@ -155,16 +155,16 @@ pub async fn peer_task(
                 println!("Task cancelled mid init");
                 return;
             },
-            msg = read_message(stream) => {
+            msg = read_message(&mut stream) => {
                 match msg {
                     Ok(PeerMessage::Bitfield(b)) => {
                         let mut reg = registry.lock().await;
-                        reg.set_bitfield(peer_addr, &b);
+                        reg.set_bitfield(&peer_addr, &b);
                         break;
                     }
                     Ok(PeerMessage::Have(i)) => {
                         let mut reg = registry.lock().await;
-                        reg.set_have(peer_addr, i);
+                        reg.set_have(&peer_addr, i);
                     }
                     Ok(PeerMessage::Unchoke) =>{
                         println!("Got Unchoke without Bitfield - {}", peer_addr);
@@ -190,7 +190,7 @@ pub async fn peer_task(
             println!("Cancelled while waiting for unchoke - [{}]", peer_addr);
             return;
         }
-        result = wait_for_unchoke(stream) => {
+        result = wait_for_unchoke(&mut stream) => {
             if result.is_err() {
                 eprintln!("[{}] - unchoke timeout", peer_addr);
                 return;
@@ -208,7 +208,7 @@ pub async fn peer_task(
         let piece_index = {
             let reg = registry.lock().await;
             let state = dl_state.lock().await;
-            reg.rarest_piece_for_peer(peer_addr, &state.needed, &state.in_progress)
+            reg.rarest_piece_for_peer(&peer_addr, &state.needed, &state.in_progress)
         };
 
         let Some(piece_index) = piece_index else{
@@ -227,7 +227,7 @@ pub async fn peer_task(
             standard_piece_length
         };
 
-        match download_piece(stream, peer_addr, piece_length, piece_index, token).await {
+        match download_piece(&mut stream, &peer_addr, piece_length, piece_index, &token).await {
             Ok(piece_buf) => {
                 if !verify_piece(&piece_buf.data, &piece_hashes[piece_index as usize]){
                     eprintln!("Piece mismatch, discarding piece");
@@ -272,6 +272,8 @@ pub async fn peer_task(
 
             Err(e) => {
                 eprintln!("[{}] piece {} failed: {}", peer_addr, piece_index, e);
+                drop(e);
+                
                 let mut state = dl_state.lock().await;
                 state.mark_failed(piece_index);
                 return;

@@ -5,14 +5,15 @@ mod peer;
 mod download;
 mod piece;
 
-use std::fs::{self};
+use std::{fs::{self}, sync::Arc};
 use parser::Torrent;
 use build_request::{calculate_info_hash, split_pieces, calculate_torrent_size, generate_id, build_http_url};
+use tokio::{net::TcpStream, sync::Mutex};
 
-use crate::{download::bit_torrent_handshake, download::download_piece, response::parse_response};
+use crate::{download::{DownloadState, bit_torrent_handshake, download_piece, run_download}, peer::PeerRegistry, piece::piece_to_hash, response::parse_response};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     let torrent_file = fs::read("/home/daksh/Downloads/ubuntu-26.04-desktop-amd64.iso.torrent").unwrap();
 
     let file_content: Torrent = serde_bencode::from_bytes(&torrent_file).unwrap();
@@ -45,7 +46,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let peers = parse_response(&tracker_response_body);
 
-    let mut piece_index = 0;
+    let mut handshaked_peers: Vec<(String, TcpStream)> = vec![];
+    for peer in peers{
+        match bit_torrent_handshake(&peer, peer_id_bytes, info_hash_bytes).await {
+            Ok(stream) => {
+                handshaked_peers.push((format!("{}:{}", peer.ip, peer.port), stream));
+            }
+            Err(e) =>{
+                eprintln!("{}", e);
+                continue;
+            }
+        }
+    }
+
+    let mut piece_hashes: Vec<[u8; 20]> = vec![];
+    for piece in pieces_split{
+        piece_hashes.push(piece_to_hash(&piece));
+    }
+
+    let (total_length, num_pieces) = calculate_torrent_size(&file_content);
+    let standard_piece_length = file_content.info.piece_len;
+
+    let registry = Arc::new(Mutex::new(PeerRegistry::new(num_pieces)));
+    let dl_state = Arc::new(Mutex::new(DownloadState::new(num_pieces)));
+    let arc_piece_hashes = Arc::new(piece_hashes);
+    let output_dir = "/home/daksh/Downloads/";
+
+    println!("got required data");
+
+    run_download(handshaked_peers, registry, dl_state, standard_piece_length, total_length, num_pieces, arc_piece_hashes, output_dir).await?;
 
     Ok(())
 

@@ -68,3 +68,10 @@ pub fn verify_piece(received_piece: &[u8], expected_hash: &[u8; 20]) -> bool {
     hasher.update(received_piece);
     hasher.finalize().as_slice() == expected_hash
 }
+
+pub fn piece_to_hash(piece: &[u8; 20]) -> [u8; 20] {
+    let mut hasher = Sha1::new();
+    hasher.update(piece);
+    let piece_hash: [u8;20] = hasher.finalize().into();
+    piece_hash
+}
