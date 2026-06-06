@@ -14,7 +14,7 @@ use crate::{download::{DownloadState, bit_torrent_handshake, download_piece, run
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-    let torrent_file = fs::read("/home/daksh/Downloads/big-buck-bunny.torrent").unwrap();
+    let torrent_file = fs::read("/home/daksh/Downloads/ubuntu-26.04-desktop-amd64.iso.torrent").unwrap();
 
     let file_content: Torrent = serde_bencode::from_bytes(&torrent_file).unwrap();
     
@@ -46,16 +46,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
 
     let peers = parse_response(&tracker_response_body);
 
+    let mut handles = vec![];
+    for peer in peers {
+        let handle = tokio::spawn(async move {
+            match bit_torrent_handshake(&peer, peer_id_bytes, info_hash_bytes).await {
+                Ok(stream) => Some((format!("{}:{}", peer.ip, peer.port), stream)),
+                Err(e) => {
+                    eprintln!("{}", e);
+                    None
+                }
+            }
+        });
+        handles.push(handle);
+    }
+
     let mut handshaked_peers: Vec<(String, TcpStream)> = vec![];
-    for peer in peers{
-        match bit_torrent_handshake(&peer, peer_id_bytes, info_hash_bytes).await {
-            Ok(stream) => {
-                handshaked_peers.push((format!("{}:{}", peer.ip, peer.port), stream));
-            }
-            Err(e) =>{
-                eprintln!("{}", e);
-                continue;
-            }
+    for handle in handles {
+        if let Ok(Some(peer_data)) = handle.await {
+            handshaked_peers.push(peer_data);
         }
     }
 

@@ -197,8 +197,8 @@ pub async fn request_blocks(stream: &mut TcpStream, piece_length: u64, piece_ind
         req.extend_from_slice(&13u32.to_be_bytes());
         req.push(6);
         req.extend_from_slice(&piece_index.to_be_bytes());
-        req.extend_from_slice(&begin.to_be_bytes());        // begin and length are u64 but to_be_bytes() on a u64 gives 8 bytes instead of 4. The peer receives a malformed request and either resets or ignores you.
-        req.extend_from_slice(&length.to_be_bytes());
+        req.extend_from_slice(&(begin as u32).to_be_bytes());        // begin and length are u64 but to_be_bytes() on a u64 gives 8 bytes instead of 4. The peer receives a malformed request and either resets or ignores you.
+        req.extend_from_slice(&(length as u32).to_be_bytes());
         stream.write_all(&req).await?;
         println!("Request - {:?}",req );
     }

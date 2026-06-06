@@ -30,12 +30,12 @@ impl PeerMessage{
             5 => Ok(Self::Bitfield(payload.to_vec())),
             6 => Ok(Self::Request {
                 index: u32::from_be_bytes(payload[..4].try_into()?),
-                begin: u64::from_be_bytes(payload[4..8].try_into()?),
+                begin: u32::from_be_bytes(payload[4..8].try_into()?) as u64,
                 length: u32::from_be_bytes(payload[8..12].try_into()?)
             }),
             7 => Ok(Self::Piece{
                 index: u32::from_be_bytes(payload[..4].try_into()?),
-                begin: u64::from_be_bytes(payload[4..8].try_into()?),
+                begin: u32::from_be_bytes(payload[4..8].try_into()?) as u64,
                 data: payload[8..].to_vec(),
             }),
             8 => Ok(Self::Cancel),
@@ -129,7 +129,7 @@ pub async fn read_message(stream: &mut TcpStream) -> Result<PeerMessage, Box<dyn
     println!("Readed message");
 
     let id = message[0];
-    println!("{:?}", PeerMessage::parse_peer_message(&id, &message[1..]));
+    // println!("{:?}", PeerMessage::parse_peer_message(&id, &message[1..]));
     PeerMessage::parse_peer_message(&id, &message[1..])
 
     // Ok()
@@ -240,7 +240,7 @@ pub async fn peer_task(
 
                 println!("[{}] piece verified - {}", peer_addr, piece_index);
 
-                let offset = piece_index as u64 * piece_length;
+                let offset = piece_index as u64 * standard_piece_length;
                 {
                     let mut f = file.lock().await;
                     if f.seek(std::io::SeekFrom::Start(offset)).await.is_err() || f.write_all(&piece_buf.data).await.is_err(){
