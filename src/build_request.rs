@@ -147,7 +147,7 @@ pub fn build_http_url(file_content: &parser::Torrent, torrent_file: &Vec<u8>, pe
     let downloading_left = calculate_torrent_size(file_content);
     let compact = 1;
     
-    let url = format!("{}?info_hash={}&peer_id={}&port={}&uploaded={}&downloaded={}&left={:?}&compact={}",
+    let url = format!("{}?info_hash={}&peer_id={}&port={}&uploaded={}&downloaded={}&left={:?}&compact={}&numwant=200",
                                 announce_url,encoded_info_hash,peer_id,PORT,uploaded,downloaded,downloading_left,compact);
 
     // println!("{}", url);

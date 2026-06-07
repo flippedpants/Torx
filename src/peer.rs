@@ -202,6 +202,10 @@ pub async fn peer_task(
 
     loop {
         if token.is_cancelled() {
+            {
+                let mut ui = ui_state.lock().unwrap();
+                ui.active_peers = ui.active_peers.saturating_sub(1);
+            }
             return;
         }
 
@@ -213,6 +217,10 @@ pub async fn peer_task(
 
         let Some(piece_index) = piece_index else{
             crate::logger::log(&format!("[{}] no more pieces to download", peer_addr));
+            {
+                let mut ui = ui_state.lock().unwrap();
+                ui.active_peers = ui.active_peers.saturating_sub(1);
+            }
             return;
         };
 
@@ -267,6 +275,10 @@ pub async fn peer_task(
                     if state.is_complete() {
                         // println!("all pieces downloaded!");
                         token.cancel(); // stop all other peer tasks
+                        {
+                            let mut ui = ui_state.lock().unwrap();
+                            ui.active_peers = ui.active_peers.saturating_sub(1);
+                        }
                         return;
                     }
                 }
@@ -274,10 +286,30 @@ pub async fn peer_task(
 
             Err(e) => {
                 crate::logger::log(&format!("[{}] piece {} failed: {}", peer_addr, piece_index, e));
-                drop(e);
                 
-                let mut state = dl_state.lock().await;
-                state.mark_failed(piece_index);
+                let is_terminal = if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+                    matches!(io_err.kind(), 
+                        std::io::ErrorKind::BrokenPipe | 
+                        std::io::ErrorKind::ConnectionReset | 
+                        std::io::ErrorKind::ConnectionAborted |
+                        std::io::ErrorKind::UnexpectedEof |
+                        std::io::ErrorKind::NotConnected)
+                } else {
+                    false
+                };
+
+                {
+                    let mut state = dl_state.lock().await;
+                    state.mark_failed(piece_index);
+                }
+
+                if is_terminal {
+                    {
+                        let mut ui = ui_state.lock().unwrap();
+                        ui.active_peers = ui.active_peers.saturating_sub(1);
+                    }
+                    return;
+                }
                 continue;
             }
         }

@@ -5,14 +5,15 @@ mod peer;
 mod download;
 mod piece;
 mod ui;
-pub mod logger;
+mod logger;
+mod storage;
 
 use std::{fs::{self}, sync::Arc};
 use parser::Torrent;
 use build_request::{calculate_info_hash, split_pieces, calculate_torrent_size, generate_id, build_http_url};
 use tokio::{net::TcpStream, sync::Mutex};
 
-use crate::{download::{DownloadState, bit_torrent_handshake, download_piece, run_download}, peer::PeerRegistry, piece::piece_to_hash, response::parse_response};
+use crate::{download::{DownloadState, bit_torrent_handshake, run_download}, peer::PeerRegistry, response::parse_response};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
@@ -91,6 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
         needed_count: num_pieces as usize,
         total_pieces: num_pieces,
         complete: false,
+        active_peers,
     }));
 
     let dl_state_clone = Arc::clone(&dl_state);
@@ -105,7 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
     });
 
     let ui_handle = tokio::spawn(async move {
-        let _ = ui::run_ui(ui_state, single_file_name, total_length, active_peers, token_ui).await;
+        let _ = ui::run_ui(ui_state, single_file_name, total_length, token_ui).await;
     });
 
     let _ = tokio::join!(download_handle, ui_handle);

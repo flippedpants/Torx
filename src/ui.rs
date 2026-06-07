@@ -22,6 +22,7 @@ pub struct UiState {
     pub needed_count: usize,
     pub total_pieces: u32,
     pub complete: bool,
+    pub active_peers: usize,
 }
 
 /// Runs the TUI on a dedicated blocking thread so it never starves the tokio
@@ -31,14 +32,13 @@ pub async fn run_ui(
     ui_state: Arc<StdMutex<UiState>>,
     torrent_name: String,
     total_length: u64,
-    active_peers: usize,
     token: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let token_clone = token.clone();
 
     // Run ALL terminal I/O on a blocking thread so we never block tokio workers.
     let result = tokio::task::spawn_blocking(move || {
-        run_ui_blocking(ui_state, torrent_name, total_length, active_peers, token_clone)
+        run_ui_blocking(ui_state, torrent_name, total_length, token_clone)
     }).await?;
 
     result
@@ -48,7 +48,6 @@ fn run_ui_blocking(
     ui_state: Arc<StdMutex<UiState>>,
     torrent_name: String,
     total_length: u64,
-    active_peers: usize,
     token: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     enable_raw_mode()?;
@@ -69,9 +68,9 @@ fn run_ui_blocking(
         }
 
         // Read shared state — this is a std::sync::Mutex, so it's instant.
-        let (downloaded_bytes, needed_count, total_pieces, complete) = {
+        let (downloaded_bytes, needed_count, total_pieces, complete, active_peers) = {
             let state = ui_state.lock().unwrap();
-            (state.downloaded_bytes, state.needed_count, state.total_pieces, state.complete)
+            (state.downloaded_bytes, state.needed_count, state.total_pieces, state.complete, state.active_peers)
         };
 
         if complete {
@@ -106,24 +105,26 @@ fn run_ui_blocking(
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(8), // ASCII Art
+                    Constraint::Length(9), // ASCII Art
                     Constraint::Length(3), // Progress Bar
                     Constraint::Min(0),    // Stats
                 ])
                 .split(size);
 
             // ASCII Art
-            let ascii_art = r#"
-  _______ ____  ______   __
- |__   __/ __ \|  __ \ \ / /
-    | | | |  | | |__) \ V / 
-    | | | |  | |  _  / > <  
-    | | | |__| | | \ \/ . \ 
-    |_|  \____/|_|  \_\_/ \_\
-"#;
+            let ascii_art = r#" 
+ ███████████    ███████    ███████████   █████ █████
+░█░░░███░░░█  ███░░░░░███ ░░███░░░░░███ ░░███ ░░███
+░   ░███  ░  ███     ░░███ ░███    ░███  ░░███ ███
+    ░███    ░███      ░███ ░██████████    ░░█████
+    ░███    ░███      ░███ ░███░░░░░███    ███░███
+    ░███    ░░███     ███  ░███    ░███   ███ ░░███
+    █████    ░░░███████░   █████   █████ █████ █████
+   ░░░░░       ░░░░░░░    ░░░░░   ░░░░░ ░░░░░ ░░░░░"#;
+            // println!("{:?}", ascii_art.lines().count());
             let title = Paragraph::new(ascii_art)
                 .style(Style::default().fg(Color::Cyan))
-                .alignment(Alignment::Center);
+                .alignment(Alignment::Left);                // lines are getting centered seperately
             f.render_widget(title, chunks[0]);
 
             // Progress Bar
