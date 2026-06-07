@@ -70,7 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
 
     let mut piece_hashes: Vec<[u8; 20]> = vec![];
     for piece in pieces_split{
-        piece_hashes.push(piece_to_hash(&piece));
+        piece_hashes.push(piece);
     }
 
     let (total_length, num_pieces) = calculate_torrent_size(&file_content);

@@ -234,7 +234,7 @@ pub async fn peer_task(
                     {
                         let mut state = dl_state.lock().await;
                         state.mark_failed(piece_index);
-                        return;
+                        continue;
                     }
                 }
 
@@ -247,7 +247,7 @@ pub async fn peer_task(
                         crate::logger::log(&format!("[{}] failed to write piece {}", peer_addr, piece_index));
                         let mut state = dl_state.lock().await;
                         state.mark_failed(piece_index);
-                        return;
+                        continue;
                     }
                 }
 
@@ -278,7 +278,7 @@ pub async fn peer_task(
                 
                 let mut state = dl_state.lock().await;
                 state.mark_failed(piece_index);
-                return;
+                continue;
             }
         }
 
