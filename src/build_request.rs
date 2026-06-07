@@ -150,7 +150,7 @@ pub fn build_http_url(file_content: &parser::Torrent, torrent_file: &Vec<u8>, pe
     let url = format!("{}?info_hash={}&peer_id={}&port={}&uploaded={}&downloaded={}&left={:?}&compact={}",
                                 announce_url,encoded_info_hash,peer_id,PORT,uploaded,downloaded,downloading_left,compact);
 
-    println!("{}", url);
+    // println!("{}", url);
 
     url
 }

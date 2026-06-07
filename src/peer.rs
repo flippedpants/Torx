@@ -122,17 +122,15 @@ pub async fn read_message(stream: &mut TcpStream) -> Result<PeerMessage, Box<dyn
         return Ok(PeerMessage::KeepAlive);
     }
 
-    println!("Readed length bytes");
+    // println!("Readed length bytes");
 
     let mut message = vec![0u8; message_length as usize];
     stream.read_exact(&mut message).await?;
-    println!("Readed message");
+    // println!("Readed message");
 
     let id = message[0];
     // println!("{:?}", PeerMessage::parse_peer_message(&id, &message[1..]));
     PeerMessage::parse_peer_message(&id, &message[1..])
-
-    // Ok()
 }
 
 pub async fn peer_task(
@@ -140,6 +138,7 @@ pub async fn peer_task(
     mut stream: TcpStream,
     registry: Arc<Mutex<PeerRegistry>>,
     dl_state: Arc<Mutex<DownloadState>>,
+    ui_state: Arc<std::sync::Mutex<crate::ui::UiState>>,
     token: CancellationToken,
     standard_piece_length: u64,
     total_length: u64,
@@ -147,12 +146,12 @@ pub async fn peer_task(
     piece_hashes: Arc<Vec<[u8; 20]>>,
     file: Arc<Mutex<File>>
 ){
-    println!("[{}] - task started", peer_addr);
+    crate::logger::log(&format!("[{}] - task started", peer_addr));
 
     loop{
         tokio::select! {
             _ = token.cancelled() => {
-                println!("Task cancelled mid init");
+                // println!("Task cancelled mid init");
                 return;
             },
             msg = read_message(&mut stream) => {
@@ -167,12 +166,13 @@ pub async fn peer_task(
                         reg.set_have(&peer_addr, i);
                     }
                     Ok(PeerMessage::Unchoke) =>{
-                        println!("Got Unchoke without Bitfield - {}", peer_addr);
+                        // println!("Got Unchoke without Bitfield - {}", peer_addr);
                         break;
                     }
                     Ok(_) => continue,
                     Err(e) => {
-                        eprintln!("[{}] error during init - {}", peer_addr, e);
+                        crate::logger::log(&format!("[{}] error during init - {}", peer_addr, e));
+                        let _ = e;
                         break;
                     }
                 }
@@ -181,24 +181,24 @@ pub async fn peer_task(
     }
 
     if stream.write_all(&[0,0,0,1,2]).await.is_err() {
-        eprintln!("Could not sent interested to [{}] ", peer_addr);
+        crate::logger::log(&format!("Could not send interested to [{}]", peer_addr));
         return;
     }
 
     tokio::select! {
         _ = token.cancelled() => {
-            println!("Cancelled while waiting for unchoke - [{}]", peer_addr);
+            // println!("Cancelled while waiting for unchoke - [{}]", peer_addr);
             return;
         }
         result = wait_for_unchoke(&mut stream) => {
             if result.is_err() {
-                eprintln!("[{}] - unchoke timeout", peer_addr);
+                crate::logger::log(&format!("[{}] - unchoke timeout", peer_addr));
                 return;
             }
         }
     }
 
-    println!("Starting Download for - [{}]", peer_addr);
+    // println!("Starting Download for - [{}]", peer_addr);
 
     loop {
         if token.is_cancelled() {
@@ -212,7 +212,7 @@ pub async fn peer_task(
         };
 
         let Some(piece_index) = piece_index else{
-            println!("[{}] no more pieces to download", peer_addr);
+            crate::logger::log(&format!("[{}] no more pieces to download", peer_addr));
             return;
         };
 
@@ -230,7 +230,7 @@ pub async fn peer_task(
         match download_piece(&mut stream, &peer_addr, piece_length, piece_index, &token).await {
             Ok(piece_buf) => {
                 if !verify_piece(&piece_buf.data, &piece_hashes[piece_index as usize]){
-                    eprintln!("Piece mismatch, discarding piece");
+                    crate::logger::log(&format!("[{}] Piece mismatch, discarding piece {}", peer_addr, piece_index));
                     {
                         let mut state = dl_state.lock().await;
                         state.mark_failed(piece_index);
@@ -238,13 +238,13 @@ pub async fn peer_task(
                     }
                 }
 
-                println!("[{}] piece verified - {}", peer_addr, piece_index);
+                crate::logger::log(&format!("[{}] piece verified - {}", peer_addr, piece_index));
 
                 let offset = piece_index as u64 * standard_piece_length;
                 {
                     let mut f = file.lock().await;
                     if f.seek(std::io::SeekFrom::Start(offset)).await.is_err() || f.write_all(&piece_buf.data).await.is_err(){
-                        eprintln!("[{}] failed to write piece {}", peer_addr, piece_index);
+                        crate::logger::log(&format!("[{}] failed to write piece {}", peer_addr, piece_index));
                         let mut state = dl_state.lock().await;
                         state.mark_failed(piece_index);
                         return;
@@ -254,16 +254,18 @@ pub async fn peer_task(
                 {
                     let mut state = dl_state.lock().await;
                     state.mark_done(piece_index);
-                    println!(
-                        "[{}] piece {} done — {}/{} complete",
-                        peer_addr,
-                        piece_index,
-                        state.needed.iter().filter(|&&n| !n).count(),
-                        num_pieces
-                    );
+                    state.downloaded_bytes += piece_length as u64;
+
+                    // Update the UI snapshot (std::sync::Mutex — instant, never awaits)
+                    {
+                        let mut ui = ui_state.lock().unwrap();
+                        ui.downloaded_bytes = state.downloaded_bytes;
+                        ui.needed_count = state.needed.iter().filter(|&&n| n).count();
+                        ui.complete = state.is_complete();
+                    }
 
                     if state.is_complete() {
-                        println!("all pieces downloaded!");
+                        // println!("all pieces downloaded!");
                         token.cancel(); // stop all other peer tasks
                         return;
                     }
@@ -271,7 +273,7 @@ pub async fn peer_task(
             }
 
             Err(e) => {
-                eprintln!("[{}] piece {} failed: {}", peer_addr, piece_index, e);
+                crate::logger::log(&format!("[{}] piece {} failed: {}", peer_addr, piece_index, e));
                 drop(e);
                 
                 let mut state = dl_state.lock().await;

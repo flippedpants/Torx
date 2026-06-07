@@ -36,7 +36,9 @@ impl Handshake{
 pub struct DownloadState {
     pub needed: Vec<bool>,
     pub in_progress: HashSet<u32>,
-    pub num_pieces: u32
+    pub num_pieces: u32,
+    pub downloaded_bytes: u64,
+    pub active_peers: u32,
 }   
 
 impl DownloadState {
@@ -44,7 +46,9 @@ impl DownloadState {
         DownloadState{
             needed: vec![true; num_pieces as usize],
             in_progress: HashSet::new(),
-            num_pieces
+            num_pieces,
+            downloaded_bytes: 0,
+            active_peers: 0,
         }
     }
 
@@ -78,13 +82,13 @@ pub async fn bit_torrent_handshake(peer: &PeerAddress, peer_id: [u8; 20],info_ha
         Ok(Ok(mut stream)) => {
 
             if let Err(e) = stream.write_all(&req_bytes).await {
-                eprintln!("Failed to write handshake to {}: {}", addr, e);
+                // eprintln!("Failed to write handshake to {}: {}", addr, e);
                 return Err(e.into());
             }
 
             let mut handshake_res_buf = [0u8; 68];
             if let Err(e) = stream.read_exact(&mut handshake_res_buf).await {
-                eprintln!("Failed to read handshake from {}: {}", addr, e);
+                // eprintln!("Failed to read handshake from {}: {}", addr, e);
                 return Err(e.into());
             }
 
@@ -97,15 +101,15 @@ pub async fn bit_torrent_handshake(peer: &PeerAddress, peer_id: [u8; 20],info_ha
                 return Err(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Info hash mismatch with peer {}", addr))));
             }
 
-            println!("Successfully handshaked with {}", addr);
+            // println!("Successfully handshaked with {}", addr);
             return Ok(stream);   
         }
         Ok(Err(e)) => {
-            eprintln!("Connection failed to {}: {}", addr, e);
+            // eprintln!("Connection failed to {}: {}", addr, e);
             return Err(e.into());
         }
         Err(e) => {
-            eprintln!("Connection to {} timed out", addr);
+            // eprintln!("Connection to {} timed out", addr);
             return Err(e.into());
         }
     }
@@ -137,12 +141,12 @@ pub async fn download_piece(stream: &mut TcpStream,peer_addr: &String, piece_len
                     },
 
                     PeerMessage::Choke => {
-                        println!("[{}] choked mid-piece {}", peer_addr, piece_index);
+                        crate::logger::log(&format!("[{}] choked mid-piece {}", peer_addr, piece_index));
                         wait_for_unchoke(stream).await?;
                         request_blocks(stream, piece_length, piece_index, num_blocks, &buf.recv_blocks).await?;
                     },
                     PeerMessage::Have(i) => {
-                        println!("[{}] have piece {}", peer_addr, i);
+                        crate::logger::log(&format!("[{}] have piece {}", peer_addr, i));
                     },
                     _ => continue,
 
@@ -156,15 +160,15 @@ pub async fn wait_for_unchoke(stream: &mut TcpStream) -> Result<(), Box<dyn std:
     let unchoke  = timeout(Duration::from_secs(30), async {
     loop{
         match read_message(stream).await? {
-            PeerMessage::Choke => {println!("got choke — continuing to wait"); continue;},
+            PeerMessage::Choke => { /* println!("got choke — continuing to wait"); */ continue;},
             PeerMessage::Unchoke => return Ok(()),
             PeerMessage::KeepAlive => {
-                println!("Keep alive");
+                // println!("Keep alive");
                 tokio::task::yield_now().await;
                 continue;
             },
-            PeerMessage::Have(i) => println!("Have piece - {}", i),
-            PeerMessage::Bitfield(b) => println!("bitfield: {} bytes", b.len()),
+            PeerMessage::Have(i) => { /* println!("Have piece - {}", i) */ },
+            PeerMessage::Bitfield(b) => { /* println!("bitfield: {} bytes", b.len()) */ },
             _ =>{
                 tokio::task::yield_now().await;
                 continue;
@@ -200,10 +204,10 @@ pub async fn request_blocks(stream: &mut TcpStream, piece_length: u64, piece_ind
         req.extend_from_slice(&(begin as u32).to_be_bytes());        // begin and length are u64 but to_be_bytes() on a u64 gives 8 bytes instead of 4. The peer receives a malformed request and either resets or ignores you.
         req.extend_from_slice(&(length as u32).to_be_bytes());
         stream.write_all(&req).await?;
-        println!("Request - {:?}",req );
+        // println!("Request - {:?}",req );
     }
     
-    println!("Sent request");
+    // println!("Sent request");
     Ok(())
 }
 
@@ -211,11 +215,13 @@ pub async fn run_download(
     peers: Vec<(String, TcpStream)>,
     registry: Arc<Mutex<PeerRegistry>>,
     dl_state: Arc<Mutex<DownloadState>>,
+    ui_state: Arc<std::sync::Mutex<crate::ui::UiState>>,
     standard_piece_length: u64,
     total_length: u64,
     num_pieces: u32,
     piece_hashes: Arc<Vec<[u8; 20]>>,
-    output_dir: &String
+    output_dir: &String,
+    token: CancellationToken
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
 
     let file = tokio::fs::OpenOptions::new()
@@ -227,11 +233,11 @@ pub async fn run_download(
     file.set_len(total_length).await?;
         let file = Arc::new(Mutex::new(file));
         let mut handles: Vec<tokio::task::JoinHandle<()>> = vec![];
-        let token = CancellationToken::new();
 
     for (peer_addr, stream) in peers {
             let registry_clone = Arc::clone(&registry);
             let dl_state_clone = Arc::clone(&dl_state);
+            let ui_state_clone = Arc::clone(&ui_state);
             let hashes_clone = Arc::clone(&piece_hashes);
             let file_clone = Arc::clone(&file);
             let token_clone = token.clone(); 
@@ -242,6 +248,7 @@ pub async fn run_download(
                     stream, // Move the stream directly into the thread
                     registry_clone,
                     dl_state_clone,
+                    ui_state_clone,
                     token_clone,
                     standard_piece_length,
                     total_length,
@@ -254,7 +261,7 @@ pub async fn run_download(
         }
 
         for handle in handles{
-            handle.await;
+            let _ = handle.await;
         }
 
     Ok(())

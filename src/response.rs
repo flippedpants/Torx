@@ -26,7 +26,7 @@ pub struct PeerAddress{
 
 pub fn parse_response(response_byte: &bytes::Bytes) -> Vec<PeerAddress>{
     let res: Response = serde_bencode::from_bytes(response_byte).unwrap();
-    println!("seeders: {:?}, leechers: {:?}", res.complete, res.incomplete);
+    // println!("seeders: {:?}, leechers: {:?}", res.complete, res.incomplete);
 
     // println!("{:?}", response);
 
@@ -54,8 +54,8 @@ pub fn parse_response(response_byte: &bytes::Bytes) -> Vec<PeerAddress>{
         i += 6;
     }
 
-    println!("{:#?}", peer_list);
-    println!("{}", peer_list.len());
+    // println!("{:#?}", peer_list);
+    // println!("{}", peer_list.len());
 
     peer_list
 }   

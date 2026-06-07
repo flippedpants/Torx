@@ -4,6 +4,8 @@ mod response;
 mod peer;
 mod download;
 mod piece;
+mod ui;
+pub mod logger;
 
 use std::{fs::{self}, sync::Arc};
 use parser::Torrent;
@@ -18,7 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
 
     let file_content: Torrent = serde_bencode::from_bytes(&torrent_file).unwrap();
     
-    println!("{:?}", file_content.info.mode);
+    // println!("{:?}", file_content.info.mode);
 
     // extract_value(file_content);
     let info_hash = calculate_info_hash(&torrent_file).unwrap();
@@ -26,33 +28,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
     let peer_id = generate_id();
 
     let pieces_split = split_pieces(&file_content.info.pieces);
-    println!("{:?}", calculate_torrent_size(&file_content));
-    println!("{}", peer_id);
+    // println!("{:?}", calculate_torrent_size(&file_content));
+    // println!("{}", peer_id);
 
     let url = build_http_url(&file_content, &torrent_file, &peer_id);
 
+    println!("Fetching peers from tracker...");
     let http_client = reqwest::Client::new();
     let response = http_client.get(url).send().await?;
 
-    // println!("{:?}", response);
-
     let tracker_response_body = response.bytes().await?;
-    // parse_response(&tracker_response_body);
-
     // println!("seeders: {:?}, leechers: {:?}", response.complete, response.incomplete);
 
     let peer_id_bytes: [u8; 20] = peer_id.as_bytes().try_into().expect("Length Mismatch");
     let info_hash_bytes = info_hash.1;
 
     let peers = parse_response(&tracker_response_body);
+    println!("Found {} peers! Handshaking and connecting... (this may take up to 20 seconds depending on peer response times)", peers.len());
 
     let mut handles = vec![];
     for peer in peers {
         let handle = tokio::spawn(async move {
             match bit_torrent_handshake(&peer, peer_id_bytes, info_hash_bytes).await {
                 Ok(stream) => Some((format!("{}:{}", peer.ip, peer.port), stream)),
-                Err(e) => {
-                    eprintln!("{}", e);
+                Err(_e) => {
+                    // eprintln!("{}", _e);
                     None
                 }
             }
@@ -63,6 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
     let mut handshaked_peers: Vec<(String, TcpStream)> = vec![];
     for handle in handles {
         if let Ok(Some(peer_data)) = handle.await {
+            
             handshaked_peers.push(peer_data);
         }
     }
@@ -81,10 +82,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
     let single_file_name = file_content.info.name;
     let output_dir = format!("/home/daksh/Downloads/{}", single_file_name);
 
-    println!("got required data");
+    // println!("got required data");
 
-    run_download(handshaked_peers, registry, dl_state, standard_piece_length, total_length, num_pieces, arc_piece_hashes, &output_dir).await?;
+    let active_peers = handshaked_peers.len();
+
+    let ui_state = Arc::new(std::sync::Mutex::new(ui::UiState {
+        downloaded_bytes: 0,
+        needed_count: num_pieces as usize,
+        total_pieces: num_pieces,
+        complete: false,
+    }));
+
+    let dl_state_clone = Arc::clone(&dl_state);
+    let ui_state_clone = Arc::clone(&ui_state);
+    let token = tokio_util::sync::CancellationToken::new();
+    let token_ui = token.clone();
+
+    let download_handle = tokio::spawn(async move {
+        if let Err(e) = run_download(handshaked_peers, registry, dl_state_clone, ui_state_clone, standard_piece_length, total_length, num_pieces, arc_piece_hashes, &output_dir, token).await {
+            crate::logger::log(&format!("run_download failed: {:?}", e));
+        }
+    });
+
+    let ui_handle = tokio::spawn(async move {
+        let _ = ui::run_ui(ui_state, single_file_name, total_length, active_peers, token_ui).await;
+    });
+
+    let _ = tokio::join!(download_handle, ui_handle);
 
     Ok(())
-
 }
