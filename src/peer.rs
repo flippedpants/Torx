@@ -220,6 +220,8 @@ pub async fn peer_task(
             {
                 let mut ui = ui_state.lock().unwrap();
                 ui.active_peers = ui.active_peers.saturating_sub(1);
+                ui.logs.push(format!("[SYSTEM] Peer {} disconnected (no more pieces)", peer_addr));
+                ui.peers.retain(|p| p.ip != peer_addr);
             }
             return;
         };
@@ -227,6 +229,24 @@ pub async fn peer_task(
         {
             let mut state = dl_state.lock().await;
             state.in_progress.insert(piece_index);
+            
+            let mut ui = ui_state.lock().unwrap();
+            if (piece_index as usize) < ui.pieces.len() {
+                ui.pieces[piece_index as usize] = crate::ui::PieceStatus::Downloading;
+            }
+            ui.logs.push(format!("[DEBUG] Requesting piece {} from {}", piece_index, peer_addr));
+            
+            // Upsert peer info
+            if !ui.peers.iter().any(|p| p.ip == peer_addr) {
+                ui.peers.push(crate::ui::PeerInfo {
+                    ip: peer_addr.clone(),
+                    down_speed: 0.0,
+                    up_speed: 0.0,
+                    progress: 0.0,
+                    total_downloaded: 0,
+                    total_uploaded: 0,
+                });
+            }
         }
 
         let piece_length = if piece_index == num_pieces - 1 {
@@ -242,6 +262,9 @@ pub async fn peer_task(
                     {
                         let mut state = dl_state.lock().await;
                         state.mark_failed(piece_index);
+                        let mut ui = ui_state.lock().unwrap();
+                        ui.pieces[piece_index as usize] = crate::ui::PieceStatus::Missing;
+                        ui.logs.push(format!("[ERROR] Piece {} verification failed from {}", piece_index, peer_addr));
                         continue;
                     }
                 }
@@ -255,6 +278,9 @@ pub async fn peer_task(
                         crate::logger::log(&format!("[{}] failed to write piece {}", peer_addr, piece_index));
                         let mut state = dl_state.lock().await;
                         state.mark_failed(piece_index);
+                        let mut ui = ui_state.lock().unwrap();
+                        ui.pieces[piece_index as usize] = crate::ui::PieceStatus::Missing;
+                        ui.logs.push(format!("[ERROR] Failed to write piece {} to disk", piece_index));
                         continue;
                     }
                 }
@@ -270,6 +296,16 @@ pub async fn peer_task(
                         ui.downloaded_bytes = state.downloaded_bytes;
                         ui.needed_count = state.needed.iter().filter(|&&n| n).count();
                         ui.complete = state.is_complete();
+                        if (piece_index as usize) < ui.pieces.len() {
+                            ui.pieces[piece_index as usize] = crate::ui::PieceStatus::Complete;
+                        }
+                        ui.logs.push(format!("[INFO] Verified and saved piece {} from {}", piece_index, peer_addr));
+                        
+                        // Update peer progress and total_downloaded in table
+                        if let Some(p) = ui.peers.iter_mut().find(|p| p.ip == peer_addr) {
+                             p.total_downloaded += piece_length as u64;
+                             p.progress = (state.num_pieces - state.needed.iter().filter(|&&n| n).count() as u32) as f64 / state.num_pieces as f64;
+                        }
                     }
 
                     if state.is_complete() {
@@ -278,6 +314,7 @@ pub async fn peer_task(
                         {
                             let mut ui = ui_state.lock().unwrap();
                             ui.active_peers = ui.active_peers.saturating_sub(1);
+                            ui.logs.push("[SYSTEM] Download complete!".to_string());
                         }
                         return;
                     }
@@ -301,12 +338,17 @@ pub async fn peer_task(
                 {
                     let mut state = dl_state.lock().await;
                     state.mark_failed(piece_index);
+                    let mut ui = ui_state.lock().unwrap();
+                    ui.pieces[piece_index as usize] = crate::ui::PieceStatus::Missing;
+                    ui.logs.push(format!("[WARN] Piece {} failed from {}: {}", piece_index, peer_addr, e));
                 }
 
                 if is_terminal {
                     {
                         let mut ui = ui_state.lock().unwrap();
                         ui.active_peers = ui.active_peers.saturating_sub(1);
+                        ui.peers.retain(|p| p.ip != peer_addr);
+                        ui.logs.push(format!("[SYSTEM] Peer {} disconnected (terminal error)", peer_addr));
                     }
                     return;
                 }

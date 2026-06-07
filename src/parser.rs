@@ -41,12 +41,12 @@ pub enum FileMode {
     },
 
     MultiFileMode {
-        files: Vec<TorrentFile>
+        files: Vec<File>
     }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct TorrentFile{
+pub struct File{
     pub length: u64,
     pub path: Vec<String>
 }

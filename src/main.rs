@@ -80,19 +80,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
     let registry = Arc::new(Mutex::new(PeerRegistry::new(num_pieces)));
     let dl_state = Arc::new(Mutex::new(DownloadState::new(num_pieces)));
     let arc_piece_hashes = Arc::new(piece_hashes);
-    let single_file_name = file_content.info.name;
+    let single_file_name = file_content.info.name.clone();
     let output_dir = format!("/home/daksh/Downloads/{}", single_file_name);
 
     // println!("got required data");
 
     let active_peers = handshaked_peers.len();
 
+    let mut file_names = vec![];
+    match &file_content.info.mode {
+        parser::FileMode::SingleFileMode { .. } => file_names.push(file_content.info.name.clone()),
+        parser::FileMode::MultiFileMode { files } => {
+            for f in files {
+                file_names.push(f.path.join("/"));
+            }
+        }
+    }
+
     let ui_state = Arc::new(std::sync::Mutex::new(ui::UiState {
         downloaded_bytes: 0,
+        uploaded_bytes: 0,
         needed_count: num_pieces as usize,
         total_pieces: num_pieces,
         complete: false,
         active_peers,
+        active_tab: ui::AppTab::Overview,
+        pieces: vec![ui::PieceStatus::Missing; num_pieces as usize],
+        logs: vec!["[SYSTEM] Torx client initialized".to_string(), format!("[SYSTEM] Found {} handshaked peers", active_peers)],
+        peers: vec![],
+        file_names,
     }));
 
     let dl_state_clone = Arc::clone(&dl_state);

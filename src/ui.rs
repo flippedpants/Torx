@@ -1,10 +1,10 @@
 use std::time::{Duration, Instant};
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout},
-    style::{Color, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Gauge, Paragraph},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span, Text},
+    widgets::{Block, Borders, BorderType, Gauge, Paragraph, Tabs, Table, Row, Cell, List, ListItem, Wrap},
     Terminal,
 };
 use crossterm::{
@@ -16,18 +16,45 @@ use std::io;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio_util::sync::CancellationToken;
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum AppTab {
+    Overview,
+    Peers,
+    Files,
+    Logs,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum PieceStatus {
+    Missing,
+    Downloading,
+    Complete,
+}
+
+pub struct PeerInfo {
+    pub ip: String,
+    pub down_speed: f64,
+    pub up_speed: f64,
+    pub progress: f64,
+    pub total_downloaded: u64,
+    pub total_uploaded: u64,
+}
+
 /// Snapshot of download state for the UI to read without holding a tokio lock.
 pub struct UiState {
     pub downloaded_bytes: u64,
+    pub uploaded_bytes: u64,
     pub needed_count: usize,
     pub total_pieces: u32,
     pub complete: bool,
     pub active_peers: usize,
+    pub active_tab: AppTab,
+    pub pieces: Vec<PieceStatus>,
+    pub logs: Vec<String>,
+    pub peers: Vec<PeerInfo>,
+    pub file_names: Vec<String>,
 }
 
-/// Runs the TUI on a dedicated blocking thread so it never starves the tokio
-/// runtime.  State is shared via a lightweight `std::sync::Mutex` that the
-/// download tasks update after every piece.
 pub async fn run_ui(
     ui_state: Arc<StdMutex<UiState>>,
     torrent_name: String,
@@ -36,7 +63,6 @@ pub async fn run_ui(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let token_clone = token.clone();
 
-    // Run ALL terminal I/O on a blocking thread so we never block tokio workers.
     let result = tokio::task::spawn_blocking(move || {
         run_ui_blocking(ui_state, torrent_name, total_length, token_clone)
     }).await?;
@@ -59,7 +85,11 @@ fn run_ui_blocking(
     let start_time = Instant::now();
     let mut last_tick = Instant::now();
     let mut last_downloaded = 0u64;
-    let mut speed = 0f64;
+    let mut last_uploaded = 0u64;
+    let mut last_peer_downloaded: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut last_peer_uploaded: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut down_speed = 0f64;
+    let mut up_speed = 0f64;
     let mut confirm_exit = false;
 
     loop {
@@ -67,129 +97,93 @@ fn run_ui_blocking(
             break;
         }
 
-        // Read shared state — this is a std::sync::Mutex, so it's instant.
-        let (downloaded_bytes, needed_count, total_pieces, complete, active_peers) = {
+        let (downloaded, uploaded, needed, total_p, complete, peers_count, active_tab) = {
             let state = ui_state.lock().unwrap();
-            (state.downloaded_bytes, state.needed_count, state.total_pieces, state.complete, state.active_peers)
+            (
+                state.downloaded_bytes,
+                state.uploaded_bytes,
+                state.needed_count,
+                state.total_pieces,
+                state.complete,
+                state.active_peers,
+                state.active_tab,
+            )
         };
 
-        if complete {
-            break;
+        if complete && active_tab == AppTab::Overview {
+             // We don't break immediately anymore, we want to see the 100%
         }
 
         let now = Instant::now();
         let dt = now.duration_since(last_tick).as_secs_f64();
         if dt >= 1.0 {
-            let downloaded_since_last_tick = downloaded_bytes.saturating_sub(last_downloaded);
-            speed = downloaded_since_last_tick as f64 / dt;
-            last_downloaded = downloaded_bytes;
+            down_speed = downloaded.saturating_sub(last_downloaded) as f64 / dt;
+            up_speed = uploaded.saturating_sub(last_uploaded) as f64 / dt;
+            last_downloaded = downloaded;
+            last_uploaded = uploaded;
+
+            // Calculate per-peer speeds
+            {
+                let mut state = ui_state.lock().unwrap();
+                for p in state.peers.iter_mut() {
+                    let last_down = last_peer_downloaded.get(&p.ip).cloned().unwrap_or(0);
+                    let last_up = last_peer_uploaded.get(&p.ip).cloned().unwrap_or(0);
+                    
+                    p.down_speed = (p.total_downloaded.saturating_sub(last_down)) as f64 / dt;
+                    p.up_speed = (p.total_uploaded.saturating_sub(last_up)) as f64 / dt;
+                    
+                    last_peer_downloaded.insert(p.ip.clone(), p.total_downloaded);
+                    last_peer_uploaded.insert(p.ip.clone(), p.total_uploaded);
+                }
+            }
+
             last_tick = now;
         }
 
         let progress = if total_length > 0 {
-            (downloaded_bytes as f64 / total_length as f64).clamp(0.0, 1.0)
+            (downloaded as f64 / total_length as f64).clamp(0.0, 1.0)
         } else {
             0.0
         };
 
         let elapsed = start_time.elapsed().as_secs();
 
-        let eta_secs = if speed > 0.0 {
-            ((total_length.saturating_sub(downloaded_bytes)) as f64 / speed) as u64
-        } else {
-            0
-        };
-
         terminal.draw(|f| {
-            let size = f.area();
+            let area = f.area();
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(9), // ASCII Art
-                    Constraint::Length(3), // Progress Bar
-                    Constraint::Min(0),    // Stats
+                    Constraint::Length(12), // Header
+                    Constraint::Length(3),  // Tabs
+                    Constraint::Min(0),     // Content
+                    Constraint::Length(1),  // Footer
                 ])
-                .split(size);
+                .split(area);
 
-            // ASCII Art
-            let ascii_art = r#" 
- ███████████    ███████    ███████████   █████ █████
-░█░░░███░░░█  ███░░░░░███ ░░███░░░░░███ ░░███ ░░███
-░   ░███  ░  ███     ░░███ ░███    ░███  ░░███ ███
-    ░███    ░███      ░███ ░██████████    ░░█████
-    ░███    ░███      ░███ ░███░░░░░███    ███░███
-    ░███    ░░███     ███  ░███    ░███   ███ ░░███
-    █████    ░░░███████░   █████   █████ █████ █████
-   ░░░░░       ░░░░░░░    ░░░░░   ░░░░░ ░░░░░ ░░░░░"#;
-            // println!("{:?}", ascii_art.lines().count());
-            let title = Paragraph::new(ascii_art)
-                .style(Style::default().fg(Color::Cyan))
-                .alignment(Alignment::Left);                // lines are getting centered seperately
-            f.render_widget(title, chunks[0]);
+            render_header(f, chunks[0]);
+            render_tabs(f, chunks[1], active_tab);
 
-            // Progress Bar
-            let label = format!("{:.2}%", progress * 100.0);
-            let gauge = Gauge::default()
-                .block(Block::default().title(torrent_name.clone()).borders(Borders::ALL))
-                .gauge_style(Style::default().fg(Color::Green).bg(Color::Black))
-                .ratio(progress)
-                .label(label);
-            f.render_widget(gauge, chunks[1]);
+            match active_tab {
+                AppTab::Overview => {
+                    let content_chunks = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([
+                            Constraint::Length(35),
+                            Constraint::Min(0),
+                        ])
+                        .split(chunks[2]);
 
-            // Stats
-            let speed_mbps = speed / 1_048_576.0;
-            let downloaded_mb = downloaded_bytes as f64 / 1_048_576.0;
-            let total_mb = total_length as f64 / 1_048_576.0;
-
-            let mut stats_text = vec![
-                Line::from(vec![
-                    Span::styled("Total Size: ", Style::default().fg(Color::Yellow)),
-                    Span::raw(format!("{:.2} MB", total_mb)),
-                ]),
-                Line::from(vec![
-                    Span::styled("Downloaded: ", Style::default().fg(Color::Yellow)),
-                    Span::raw(format!("{:.2} MB", downloaded_mb)),
-                ]),
-                Line::from(vec![
-                    Span::styled("Speed: ", Style::default().fg(Color::Yellow)),
-                    Span::raw(format!("{:.2} MB/s", speed_mbps)),
-                ]),
-                Line::from(vec![
-                    Span::styled("Active Peers: ", Style::default().fg(Color::Yellow)),
-                    Span::raw(format!("{}", active_peers)),
-                ]),
-                Line::from(vec![
-                    Span::styled("Time Elapsed: ", Style::default().fg(Color::Yellow)),
-                    Span::raw(format!("{}s", elapsed)),
-                ]),
-                Line::from(vec![
-                    Span::styled("ETA: ", Style::default().fg(Color::Yellow)),
-                    Span::raw(format!("{}s", eta_secs)),
-                ]),
-                Line::from(vec![
-                    Span::styled("Pieces Remaining: ", Style::default().fg(Color::Yellow)),
-                    Span::raw(format!("{}/{}", needed_count, total_pieces)),
-                ]),
-            ];
-
-            if confirm_exit {
-                stats_text.push(Line::from(vec![
-                    Span::styled("Are you sure you want to exit? Press '1' to confirm, or any other key to cancel.", Style::default().fg(Color::LightRed)),
-                ]));
-            } else {
-                stats_text.push(Line::from(vec![
-                    Span::styled("Press 'q' to quit", Style::default().fg(Color::DarkGray)),
-                ]));
+                    render_stats(f, content_chunks[0], downloaded, uploaded, down_speed, up_speed, peers_count, elapsed, total_length, needed, total_p, progress, &torrent_name);
+                    render_piece_map(f, content_chunks[1], &ui_state);
+                }
+                AppTab::Peers => render_peers(f, chunks[2], &ui_state),
+                AppTab::Files => render_files(f, chunks[2], &ui_state, total_length),
+                AppTab::Logs => render_logs(f, chunks[2], &ui_state),
             }
 
-            let stats_paragraph = Paragraph::new(stats_text)
-                .block(Block::default().title("Statistics").borders(Borders::ALL))
-                .alignment(Alignment::Left);
-            f.render_widget(stats_paragraph, chunks[2]);
+            render_footer(f, chunks[3], confirm_exit);
         })?;
 
-        // Poll for keyboard input — blocking for up to 200ms is fine here
-        // because we're on a dedicated OS thread, NOT on a tokio worker.
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(key) = event::read()? {
                 if confirm_exit {
@@ -199,8 +193,24 @@ fn run_ui_blocking(
                     } else {
                         confirm_exit = false;
                     }
-                } else if key.code == KeyCode::Char('q') {
-                    confirm_exit = true;
+                } else {
+                    match key.code {
+                        KeyCode::Char('q') => confirm_exit = true,
+                        KeyCode::Tab => {
+                            let mut state = ui_state.lock().unwrap();
+                            state.active_tab = match state.active_tab {
+                                AppTab::Overview => AppTab::Peers,
+                                AppTab::Peers => AppTab::Files,
+                                AppTab::Files => AppTab::Logs,
+                                AppTab::Logs => AppTab::Overview,
+                            };
+                        }
+                        KeyCode::Char('1') => ui_state.lock().unwrap().active_tab = AppTab::Overview,
+                        KeyCode::Char('2') => ui_state.lock().unwrap().active_tab = AppTab::Peers,
+                        KeyCode::Char('3') => ui_state.lock().unwrap().active_tab = AppTab::Files,
+                        KeyCode::Char('4') => ui_state.lock().unwrap().active_tab = AppTab::Logs,
+                        _ => {}
+                    }
                 }
             }
         }
@@ -211,4 +221,219 @@ fn run_ui_blocking(
     terminal.show_cursor()?;
 
     Ok(())
+}
+
+fn render_header(f: &mut ratatui::Frame, area: Rect) {
+    let ascii_art = r#"
+ ███████████    ███████    ███████████   █████ █████
+░█░░░███░░░█  ███░░░░░███ ░░███░░░░░███ ░░███ ░░███
+░   ░███  ░  ███     ░░███ ░███    ░███  ░░███ ███
+    ░███    ░███      ░███ ░██████████    ░░█████
+    ░███    ░███      ░███ ░███░░░░░███    ███░███
+    ░███    ░░███     ███  ░███    ░███   ███ ░░███
+    █████    ░░░███████░   █████   █████ █████ █████
+   ░░░░░       ░░░░░░░    ░░░░░   ░░░░░ ░░░░░ ░░░░░
+"#;
+    let header = Paragraph::new(ascii_art)
+        .style(Style::default().fg(Color::Cyan))
+        .alignment(Alignment::Left);
+    f.render_widget(header, area);
+}
+
+fn render_tabs(f: &mut ratatui::Frame, area: Rect, active_tab: AppTab) {
+    let titles = vec!["[1] Overview", "[2] Peers", "[3] Files", "[4] Logs"];
+    let index = match active_tab {
+        AppTab::Overview => 0,
+        AppTab::Peers => 1,
+        AppTab::Files => 2,
+        AppTab::Logs => 3,
+    };
+
+    let tabs = Tabs::new(titles)
+        .block(Block::default().borders(Borders::BOTTOM).border_type(BorderType::Plain))
+        .select(index)
+        .style(Style::default().fg(Color::DarkGray))
+        .highlight_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+    f.render_widget(tabs, area);
+}
+
+fn render_stats(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    downloaded: u64,
+    uploaded: u64,
+    down_speed: f64,
+    up_speed: f64,
+    peers: usize,
+    elapsed: u64,
+    total_length: u64,
+    needed: usize,
+    total_pieces: u32,
+    progress: f64,
+    torrent_name: &str,
+) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Gauge
+            Constraint::Min(0),    // Metrics
+        ])
+        .split(area);
+
+    let gauge = Gauge::default()
+        .block(Block::default().title(torrent_name).borders(Borders::ALL).border_type(BorderType::Rounded))
+        .gauge_style(Style::default().fg(Color::Green).bg(Color::Black))
+        .use_unicode(true)
+        .ratio(progress)
+        .label(format!("{:.1}%", progress * 100.0));
+    f.render_widget(gauge, chunks[0]);
+
+    let eta_secs = if down_speed > 100.0 {
+        (total_length.saturating_sub(downloaded) as f64 / down_speed) as u64
+    } else {
+        0
+    };
+
+    let stats = vec![
+        Line::from(vec![Span::styled("Status:      ", Style::default().fg(Color::DarkGray)), Span::styled(if progress >= 1.0 { "Seeding" } else { "Downloading" }, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))]),
+        Line::from(vec![Span::styled("Size:        ", Style::default().fg(Color::DarkGray)), Span::styled(format_size(total_length), Style::default().fg(Color::White))]),
+        Line::from(vec![Span::styled("Downloaded:  ", Style::default().fg(Color::DarkGray)), Span::styled(format_size(downloaded), Style::default().fg(Color::Yellow))]),
+        Line::from(vec![Span::styled("Uploaded:    ", Style::default().fg(Color::DarkGray)), Span::styled(format_size(uploaded), Style::default().fg(Color::Blue))]),
+        Line::from(""),
+        Line::from(vec![Span::styled("Down Speed:  ", Style::default().fg(Color::DarkGray)), Span::styled(format!("{}/s", format_size(down_speed as u64)), Style::default().fg(Color::Green))]),
+        Line::from(vec![Span::styled("Up Speed:    ", Style::default().fg(Color::DarkGray)), Span::styled(format!("{}/s", format_size(up_speed as u64)), Style::default().fg(Color::Blue))]),
+        Line::from(""),
+        Line::from(vec![Span::styled("Peers:       ", Style::default().fg(Color::DarkGray)), Span::styled(peers.to_string(), Style::default().fg(Color::White))]),
+        Line::from(vec![Span::styled("Pieces:      ", Style::default().fg(Color::DarkGray)), Span::styled(format!("{}/{}", total_pieces - needed as u32, total_pieces), Style::default().fg(Color::White))]),
+        Line::from(""),
+        Line::from(vec![Span::styled("Elapsed:     ", Style::default().fg(Color::DarkGray)), Span::styled(format_duration(elapsed), Style::default().fg(Color::White))]),
+        Line::from(vec![Span::styled("ETA:         ", Style::default().fg(Color::DarkGray)), Span::styled(if eta_secs > 0 { format_duration(eta_secs) } else { "--:--:--".to_string() }, Style::default().fg(Color::Yellow))]),
+    ];
+
+    let paragraph = Paragraph::new(stats)
+        .block(Block::default().title("Statistics").borders(Borders::ALL).border_type(BorderType::Rounded));
+    f.render_widget(paragraph, chunks[1]);
+}
+
+fn render_piece_map(f: &mut ratatui::Frame, area: Rect, ui_state: &Arc<StdMutex<UiState>>) {
+    let pieces = {
+        let state = ui_state.lock().unwrap();
+        state.pieces.clone()
+    };
+
+    let mut spans = Vec::new();
+    for p in pieces {
+        let span = match p {
+            PieceStatus::Complete => Span::styled("█", Style::default().fg(Color::Green)),
+            PieceStatus::Downloading => Span::styled("▒", Style::default().fg(Color::Yellow)),
+            PieceStatus::Missing => Span::styled("░", Style::default().fg(Color::DarkGray)),
+        };
+        spans.push(span);
+    }
+
+    let paragraph = Paragraph::new(Line::from(spans))
+        .block(Block::default().title("Piece Map").borders(Borders::ALL).border_type(BorderType::Rounded))
+        .wrap(Wrap { trim: false });
+    f.render_widget(paragraph, area);
+}
+
+fn render_peers(f: &mut ratatui::Frame, area: Rect, ui_state: &Arc<StdMutex<UiState>>) {
+    let peers = {
+        let state = ui_state.lock().unwrap();
+        // Since we don't have a real peer list populated yet, we'll show a placeholder
+        // or the actual list if it's there.
+        state.peers.iter().map(|p| {
+            Row::new(vec![
+                Cell::from(p.ip.clone()),
+                Cell::from(format!("{}/s", format_size(p.down_speed as u64))),
+                Cell::from(format!("{}/s", format_size(p.up_speed as u64))),
+                Cell::from(format!("{:.1}%", p.progress * 100.0)),
+            ])
+        }).collect::<Vec<_>>()
+    };
+
+    let header = Row::new(vec!["IP / Client", "Down Speed", "Up Speed", "Progress"])
+        .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        .bottom_margin(1);
+
+    let table = Table::new(peers, [
+        Constraint::Percentage(40),
+        Constraint::Percentage(20),
+        Constraint::Percentage(20),
+        Constraint::Percentage(20),
+    ])
+    .header(header)
+    .block(Block::default().title("Active Connections").borders(Borders::ALL).border_type(BorderType::Rounded));
+    
+    f.render_widget(table, area);
+}
+
+fn render_files(f: &mut ratatui::Frame, area: Rect, ui_state: &Arc<StdMutex<UiState>>, _total_size: u64) {
+    let files = {
+        let state = ui_state.lock().unwrap();
+        state.file_names.clone()
+    };
+
+    let list_items: Vec<ListItem> = files.iter().map(|name| {
+        ListItem::new(Line::from(vec![
+            Span::styled("📄 ", Style::default().fg(Color::White)),
+            Span::raw(name),
+        ]))
+    }).collect();
+
+    let list = List::new(list_items)
+        .block(Block::default().title("Files").borders(Borders::ALL).border_type(BorderType::Rounded));
+    f.render_widget(list, area);
+}
+
+fn render_logs(f: &mut ratatui::Frame, area: Rect, ui_state: &Arc<StdMutex<UiState>>) {
+    let logs = {
+        let state = ui_state.lock().unwrap();
+        state.logs.clone()
+    };
+
+    let list_items: Vec<ListItem> = logs.iter().rev().take(100).map(|log| {
+        ListItem::new(Text::raw(log))
+    }).collect();
+
+    let list = List::new(list_items)
+        .block(Block::default().title("Event Logs").borders(Borders::ALL).border_type(BorderType::Rounded));
+    f.render_widget(list, area);
+}
+
+fn render_footer(f: &mut ratatui::Frame, area: Rect, confirm_exit: bool) {
+    let text = if confirm_exit {
+        Span::styled("Are you sure? [1] Confirm Exit  [Any] Cancel", Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD))
+    } else {
+        Span::styled(" [Tab] Cycle Tabs  [1-4] Switch Tab  [q] Quit ", Style::default().fg(Color::DarkGray))
+    };
+    let p = Paragraph::new(Line::from(text)).alignment(Alignment::Center);
+    f.render_widget(p, area);
+}
+
+fn format_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.2} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.2} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+fn format_duration(seconds: u64) -> String {
+    let h = seconds / 3600;
+    let m = (seconds % 3600) / 60;
+    let s = seconds % 60;
+    if h > 0 {
+        format!("{:02}h {:02}m {:02}s", h, m, s)
+    } else {
+        format!("{:02}m {:02}s", m, s)
+    }
 }
