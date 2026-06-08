@@ -111,27 +111,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
     }));
 
     let output_dir_path = std::path::Path::new("/home/daksh/Downloads");
-    let storage = Arc::new(Mutex::new(crate::storage::FileEntry::new(&file_content, output_dir_path)));
+    let storage = Arc::new(crate::storage::FileEntry::new(&file_content, output_dir_path));
     
     {
-        let s = storage.lock().await;
-        s.preallocate().await.unwrap();
+        storage.preallocate().await.unwrap();
     }
 
+    let (ui_tx, ui_rx) = tokio::sync::mpsc::channel(100);
+
     let dl_state_clone = Arc::clone(&dl_state);
-    let ui_state_clone = Arc::clone(&ui_state);
     let token = tokio_util::sync::CancellationToken::new();
     let token_ui = token.clone();
 
     let storage_dl = Arc::clone(&storage);
+    let ui_tx_dl = ui_tx.clone();
     let download_handle = tokio::spawn(async move {
-        if let Err(e) = run_download(handshaked_peers, registry, dl_state_clone, ui_state_clone, standard_piece_length, total_length, num_pieces, arc_piece_hashes, storage_dl, token).await {
+        if let Err(e) = run_download(
+            handshaked_peers, 
+            registry, 
+            dl_state_clone, 
+            standard_piece_length, 
+            total_length, 
+            num_pieces, 
+            arc_piece_hashes, 
+            storage_dl, 
+            ui_tx_dl,
+            token
+        ).await {
             crate::logger::log(&format!("run_download failed: {:?}", e));
         }
     });
 
     let ui_handle = tokio::spawn(async move {
-        let _ = ui::run_ui(ui_state, single_file_name, total_length, token_ui).await;
+        let _ = ui::run_ui(ui_state, single_file_name, total_length, ui_rx, token_ui).await;
     });
 
     let _ = tokio::join!(download_handle, ui_handle);

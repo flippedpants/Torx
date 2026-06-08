@@ -3,7 +3,7 @@ use std::{collections::{HashMap, HashSet}, sync::Arc};
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpStream, sync::Mutex};
 use tokio_util::sync::CancellationToken;
 
-use crate::{download::{DownloadState, download_piece, wait_for_unchoke}, piece::verify_piece};
+use crate::{download::{DownloadState, download_piece}, piece::verify_piece};
 
 #[derive(Debug)]
 pub enum PeerMessage{
@@ -118,18 +118,13 @@ pub async fn read_message(stream: &mut TcpStream) -> Result<PeerMessage, Box<dyn
     let message_length = u32::from_be_bytes(buf_length);
 
     if message_length == 0 {
-        // println!("keep alive");
         return Ok(PeerMessage::KeepAlive);
     }
 
-    // println!("Readed length bytes");
-
     let mut message = vec![0u8; message_length as usize];
     stream.read_exact(&mut message).await?;
-    // println!("Readed message");
 
     let id = message[0];
-    // println!("{:?}", PeerMessage::parse_peer_message(&id, &message[1..]));
     PeerMessage::parse_peer_message(&id, &message[1..])
 }
 
@@ -138,20 +133,20 @@ pub async fn peer_task(
     mut stream: TcpStream,
     registry: Arc<Mutex<PeerRegistry>>,
     dl_state: Arc<Mutex<DownloadState>>,
-    ui_state: Arc<std::sync::Mutex<crate::ui::UiState>>,
     token: CancellationToken,
     standard_piece_length: u64,
     total_length: u64,
     num_pieces: u32,
     piece_hashes: Arc<Vec<[u8; 20]>>,
-    storage: Arc<Mutex<crate::storage::FileEntry>>
+    storage: Arc<crate::storage::FileEntry>,
+    ui_tx: tokio::sync::mpsc::Sender<crate::ui::UiUpdate>
 ){
     crate::logger::log(&format!("[{}] - task started", peer_addr));
 
     loop{
         tokio::select! {
             _ = token.cancelled() => {
-                // println!("Task cancelled mid init");
+                let _ = ui_tx.send(crate::ui::UiUpdate::ActivePeers(-1)).await;
                 return;
             },
             msg = read_message(&mut stream) => {
@@ -166,14 +161,13 @@ pub async fn peer_task(
                         reg.set_have(&peer_addr, i);
                     }
                     Ok(PeerMessage::Unchoke) =>{
-                        // println!("Got Unchoke without Bitfield - {}", peer_addr);
                         break;
                     }
                     Ok(_) => continue,
                     Err(e) => {
                         crate::logger::log(&format!("[{}] error during init - {}", peer_addr, e));
-                        let _ = e;
-                        break;
+                        let _ = ui_tx.send(crate::ui::UiUpdate::ActivePeers(-1)).await;
+                        return;
                     }
                 }
             }
@@ -182,47 +176,38 @@ pub async fn peer_task(
 
     if stream.write_all(&[0,0,0,1,2]).await.is_err() {
         crate::logger::log(&format!("Could not send interested to [{}]", peer_addr));
+        let _ = ui_tx.send(crate::ui::UiUpdate::ActivePeers(-1)).await;
         return;
     }
 
-    tokio::select! {
-        _ = token.cancelled() => {
-            // println!("Cancelled while waiting for unchoke - [{}]", peer_addr);
-            return;
-        }
-        result = wait_for_unchoke(&mut stream) => {
-            if result.is_err() {
-                crate::logger::log(&format!("[{}] - unchoke timeout", peer_addr));
-                return;
-            }
-        }
-    }
-
-    // println!("Starting Download for - [{}]", peer_addr);
+    // Upsert peer info initially
+    let _ = ui_tx.send(crate::ui::UiUpdate::PeerStats {
+        ip: peer_addr.clone(),
+        downloaded_delta: 0,
+        uploaded_delta: 0,
+        progress: 0.0,
+    }).await;
 
     loop {
         if token.is_cancelled() {
-            {
-                let mut ui = ui_state.lock().unwrap();
-                ui.active_peers = ui.active_peers.saturating_sub(1);
-            }
+            let _ = ui_tx.send(crate::ui::UiUpdate::ActivePeers(-1)).await;
             return;
         }
 
+        let (needed, in_progress) = {
+            let state = dl_state.lock().await;
+            (state.needed.clone(), state.in_progress.clone())
+        };
+
         let piece_index = {
             let reg = registry.lock().await;
-            let state = dl_state.lock().await;
-            reg.rarest_piece_for_peer(&peer_addr, &state.needed, &state.in_progress)
+            reg.rarest_piece_for_peer(&peer_addr, &needed, &in_progress)
         };
 
         let Some(piece_index) = piece_index else{
             crate::logger::log(&format!("[{}] no more pieces to download", peer_addr));
-            {
-                let mut ui = ui_state.lock().unwrap();
-                ui.active_peers = ui.active_peers.saturating_sub(1);
-                ui.logs.push(format!("[SYSTEM] Peer {} disconnected (no more pieces)", peer_addr));
-                ui.peers.retain(|p| p.ip != peer_addr);
-            }
+            let _ = ui_tx.send(crate::ui::UiUpdate::Log(format!("[SYSTEM] Peer {} disconnected (no more pieces)", peer_addr))).await;
+            let _ = ui_tx.send(crate::ui::UiUpdate::ActivePeers(-1)).await;
             return;
         };
 
@@ -230,23 +215,8 @@ pub async fn peer_task(
             let mut state = dl_state.lock().await;
             state.in_progress.insert(piece_index);
             
-            let mut ui = ui_state.lock().unwrap();
-            if (piece_index as usize) < ui.pieces.len() {
-                ui.pieces[piece_index as usize] = crate::ui::PieceStatus::Downloading;
-            }
-            ui.logs.push(format!("[DEBUG] Requesting piece {} from {}", piece_index, peer_addr));
-            
-            // Upsert peer info
-            if !ui.peers.iter().any(|p| p.ip == peer_addr) {
-                ui.peers.push(crate::ui::PeerInfo {
-                    ip: peer_addr.clone(),
-                    down_speed: 0.0,
-                    up_speed: 0.0,
-                    progress: 0.0,
-                    total_downloaded: 0,
-                    total_uploaded: 0,
-                });
-            }
+            let _ = ui_tx.send(crate::ui::UiUpdate::PieceStatus(piece_index, crate::ui::PieceStatus::Downloading)).await;
+            let _ = ui_tx.send(crate::ui::UiUpdate::Log(format!("[DEBUG] Requesting piece {} from {}", piece_index, peer_addr))).await;
         }
 
         let piece_length = if piece_index == num_pieces - 1 {
@@ -259,29 +229,22 @@ pub async fn peer_task(
             Ok(piece_buf) => {
                 if !verify_piece(&piece_buf.data, &piece_hashes[piece_index as usize]){
                     crate::logger::log(&format!("[{}] Piece mismatch, discarding piece {}", peer_addr, piece_index));
-                    {
-                        let mut state = dl_state.lock().await;
-                        state.mark_failed(piece_index);
-                        let mut ui = ui_state.lock().unwrap();
-                        ui.pieces[piece_index as usize] = crate::ui::PieceStatus::Missing;
-                        ui.logs.push(format!("[ERROR] Piece {} verification failed from {}", piece_index, peer_addr));
-                        continue;
-                    }
+                    let mut state = dl_state.lock().await;
+                    state.mark_failed(piece_index);
+                    let _ = ui_tx.send(crate::ui::UiUpdate::PieceStatus(piece_index, crate::ui::PieceStatus::Missing)).await;
+                    let _ = ui_tx.send(crate::ui::UiUpdate::Log(format!("[ERROR] Piece {} verification failed from {}", piece_index, peer_addr))).await;
+                    continue;
                 }
 
                 crate::logger::log(&format!("[{}] piece verified - {}", peer_addr, piece_index));
 
-                {
-                    let storage_lock = storage.lock().await;
-                    if storage_lock.write_piece(piece_index, standard_piece_length, &piece_buf.data).await.is_err() {
-                        crate::logger::log(&format!("[{}] failed to write piece {}", peer_addr, piece_index));
-                        let mut state = dl_state.lock().await;
-                        state.mark_failed(piece_index);
-                        let mut ui = ui_state.lock().unwrap();
-                        ui.pieces[piece_index as usize] = crate::ui::PieceStatus::Missing;
-                        ui.logs.push(format!("[ERROR] Failed to write piece {} to disk", piece_index));
-                        continue;
-                    }
+                if storage.write_piece(piece_index, standard_piece_length, &piece_buf.data).await.is_err() {
+                    crate::logger::log(&format!("[{}] failed to write piece {}", peer_addr, piece_index));
+                    let mut state = dl_state.lock().await;
+                    state.mark_failed(piece_index);
+                    let _ = ui_tx.send(crate::ui::UiUpdate::PieceStatus(piece_index, crate::ui::PieceStatus::Missing)).await;
+                    let _ = ui_tx.send(crate::ui::UiUpdate::Log(format!("[ERROR] Failed to write piece {} to disk", piece_index))).await;
+                    continue;
                 }
 
                 {
@@ -289,32 +252,22 @@ pub async fn peer_task(
                     state.mark_done(piece_index);
                     state.downloaded_bytes += piece_length as u64;
 
-                    // Update the UI snapshot (std::sync::Mutex — instant, never awaits)
-                    {
-                        let mut ui = ui_state.lock().unwrap();
-                        ui.downloaded_bytes = state.downloaded_bytes;
-                        ui.needed_count = state.needed.iter().filter(|&&n| n).count();
-                        ui.complete = state.is_complete();
-                        if (piece_index as usize) < ui.pieces.len() {
-                            ui.pieces[piece_index as usize] = crate::ui::PieceStatus::Complete;
-                        }
-                        ui.logs.push(format!("[INFO] Verified and saved piece {} from {}", piece_index, peer_addr));
-                        
-                        // Update peer progress and total_downloaded in table
-                        if let Some(p) = ui.peers.iter_mut().find(|p| p.ip == peer_addr) {
-                             p.total_downloaded += piece_length as u64;
-                             p.progress = (state.num_pieces - state.needed.iter().filter(|&&n| n).count() as u32) as f64 / state.num_pieces as f64;
-                        }
-                    }
+                    let _ = ui_tx.send(crate::ui::UiUpdate::DownloadedBytes(state.downloaded_bytes)).await;
+                    let _ = ui_tx.send(crate::ui::UiUpdate::PieceStatus(piece_index, crate::ui::PieceStatus::Complete)).await;
+                    let _ = ui_tx.send(crate::ui::UiUpdate::Log(format!("[INFO] Verified and saved piece {} from {}", piece_index, peer_addr))).await;
+                    
+                    let progress = (state.num_pieces - state.needed.iter().filter(|&&n| n).count() as u32) as f64 / state.num_pieces as f64;
+                    let _ = ui_tx.send(crate::ui::UiUpdate::PeerStats {
+                        ip: peer_addr.clone(),
+                        downloaded_delta: piece_length as u64,
+                        uploaded_delta: 0,
+                        progress,
+                    }).await;
 
                     if state.is_complete() {
-                        // println!("all pieces downloaded!");
-                        token.cancel(); // stop all other peer tasks
-                        {
-                            let mut ui = ui_state.lock().unwrap();
-                            ui.active_peers = ui.active_peers.saturating_sub(1);
-                            ui.logs.push("[SYSTEM] Download complete!".to_string());
-                        }
+                        token.cancel();
+                        let _ = ui_tx.send(crate::ui::UiUpdate::Log("[SYSTEM] Download complete!".to_string())).await;
+                        let _ = ui_tx.send(crate::ui::UiUpdate::ActivePeers(-1)).await;
                         return;
                     }
                 }
@@ -337,23 +290,17 @@ pub async fn peer_task(
                 {
                     let mut state = dl_state.lock().await;
                     state.mark_failed(piece_index);
-                    let mut ui = ui_state.lock().unwrap();
-                    ui.pieces[piece_index as usize] = crate::ui::PieceStatus::Missing;
-                    ui.logs.push(format!("[WARN] Piece {} failed from {}: {}", piece_index, peer_addr, e));
+                    let _ = ui_tx.send(crate::ui::UiUpdate::PieceStatus(piece_index, crate::ui::PieceStatus::Missing)).await;
+                    let _ = ui_tx.send(crate::ui::UiUpdate::Log(format!("[WARN] Piece {} failed from {}: {}", piece_index, peer_addr, e))).await;
                 }
 
                 if is_terminal {
-                    {
-                        let mut ui = ui_state.lock().unwrap();
-                        ui.active_peers = ui.active_peers.saturating_sub(1);
-                        ui.peers.retain(|p| p.ip != peer_addr);
-                        ui.logs.push(format!("[SYSTEM] Peer {} disconnected (terminal error)", peer_addr));
-                    }
+                    let _ = ui_tx.send(crate::ui::UiUpdate::ActivePeers(-1)).await;
+                    let _ = ui_tx.send(crate::ui::UiUpdate::Log(format!("[SYSTEM] Peer {} disconnected (terminal error)", peer_addr))).await;
                     return;
                 }
                 continue;
             }
         }
-
     }
 }

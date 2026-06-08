@@ -249,12 +249,12 @@ pub async fn run_download(
     peers: Vec<(String, TcpStream)>,
     registry: Arc<Mutex<PeerRegistry>>,
     dl_state: Arc<Mutex<DownloadState>>,
-    ui_state: Arc<std::sync::Mutex<crate::ui::UiState>>,
     standard_piece_length: u64,
     total_length: u64,
     num_pieces: u32,
     piece_hashes: Arc<Vec<[u8; 20]>>,
-    storage: Arc<Mutex<crate::storage::FileEntry>>,
+    storage: Arc<crate::storage::FileEntry>,
+    ui_tx: tokio::sync::mpsc::Sender<crate::ui::UiUpdate>,
     token: CancellationToken
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
 
@@ -263,24 +263,24 @@ pub async fn run_download(
     for (peer_addr, stream) in peers {
             let registry_clone = Arc::clone(&registry);
             let dl_state_clone = Arc::clone(&dl_state);
-            let ui_state_clone = Arc::clone(&ui_state);
             let hashes_clone = Arc::clone(&piece_hashes);
             let storage_clone = Arc::clone(&storage);
+            let ui_tx_clone = ui_tx.clone();
             let token_clone = token.clone(); 
 
             let handle = tokio::spawn(
                 peer_task(
                     peer_addr,
-                    stream, // Move the stream directly into the thread
+                    stream, 
                     registry_clone,
                     dl_state_clone,
-                    ui_state_clone,
                     token_clone,
                     standard_piece_length,
                     total_length,
                     num_pieces,
                     hashes_clone,
                     storage_clone,
+                    ui_tx_clone,
                 )
             );
             handles.push(handle);

@@ -40,6 +40,23 @@ pub struct PeerInfo {
     pub total_uploaded: u64,
 }
 
+use tokio::sync::mpsc;
+
+#[derive(Debug)]
+pub enum UiUpdate {
+    DownloadedBytes(u64),
+    UploadedBytes(u64),
+    PieceStatus(u32, PieceStatus),
+    ActivePeers(isize), // +1 or -1
+    PeerStats {
+        ip: String,
+        downloaded_delta: u64,
+        uploaded_delta: u64,
+        progress: f64,
+    },
+    Log(String),
+}
+
 /// Snapshot of download state for the UI to read without holding a tokio lock.
 pub struct UiState {
     pub downloaded_bytes: u64,
@@ -59,12 +76,13 @@ pub async fn run_ui(
     ui_state: Arc<StdMutex<UiState>>,
     torrent_name: String,
     total_length: u64,
+    rx: mpsc::Receiver<UiUpdate>,
     token: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let token_clone = token.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        run_ui_blocking(ui_state, torrent_name, total_length, token_clone)
+        run_ui_blocking(ui_state, torrent_name, total_length, rx, token_clone)
     }).await?;
 
     result
@@ -74,6 +92,7 @@ fn run_ui_blocking(
     ui_state: Arc<StdMutex<UiState>>,
     torrent_name: String,
     total_length: u64,
+    mut rx: mpsc::Receiver<UiUpdate>,
     token: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     enable_raw_mode()?;
@@ -95,6 +114,46 @@ fn run_ui_blocking(
     loop {
         if token.is_cancelled() {
             break;
+        }
+
+        // 1. Drain the channel and batch updates
+        while let Ok(update) = rx.try_recv() {
+            let mut state = ui_state.lock().unwrap();
+            match update {
+                UiUpdate::DownloadedBytes(b) => state.downloaded_bytes = b,
+                UiUpdate::UploadedBytes(b) => state.uploaded_bytes = b,
+                UiUpdate::PieceStatus(idx, status) => {
+                    if (idx as usize) < state.pieces.len() {
+                        state.pieces[idx as usize] = status;
+                    }
+                    if status == PieceStatus::Complete {
+                        state.needed_count = state.pieces.iter().filter(|&&p| p != PieceStatus::Complete).count();
+                        state.complete = state.needed_count == 0;
+                    }
+                }
+                UiUpdate::ActivePeers(delta) => {
+                    state.active_peers = (state.active_peers as isize + delta).max(0) as usize;
+                }
+                UiUpdate::PeerStats { ip, downloaded_delta, uploaded_delta, progress } => {
+                    if let Some(p) = state.peers.iter_mut().find(|p| p.ip == ip) {
+                        p.total_downloaded += downloaded_delta;
+                        p.total_uploaded += uploaded_delta;
+                        p.progress = progress;
+                    } else {
+                        state.peers.push(PeerInfo {
+                            ip,
+                            down_speed: 0.0,
+                            up_speed: 0.0,
+                            progress,
+                            total_downloaded: downloaded_delta,
+                            total_uploaded: uploaded_delta,
+                        });
+                    }
+                }
+                UiUpdate::Log(msg) => {
+                    state.logs.push(msg);
+                }
+            }
         }
 
         let (downloaded, uploaded, needed, total_p, complete, peers_count, active_tab) = {
