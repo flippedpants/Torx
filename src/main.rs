@@ -81,7 +81,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
     let dl_state = Arc::new(Mutex::new(DownloadState::new(num_pieces)));
     let arc_piece_hashes = Arc::new(piece_hashes);
     let single_file_name = file_content.info.name.clone();
-    let output_dir = format!("/home/daksh/Downloads/{}", single_file_name);
 
     // println!("got required data");
 
@@ -111,13 +110,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
         file_names,
     }));
 
+    let output_dir_path = std::path::Path::new("/home/daksh/Downloads");
+    let storage = Arc::new(Mutex::new(crate::storage::FileEntry::new(&file_content, output_dir_path)));
+    
+    {
+        let s = storage.lock().await;
+        s.preallocate().await.unwrap();
+    }
+
     let dl_state_clone = Arc::clone(&dl_state);
     let ui_state_clone = Arc::clone(&ui_state);
     let token = tokio_util::sync::CancellationToken::new();
     let token_ui = token.clone();
 
+    let storage_dl = Arc::clone(&storage);
     let download_handle = tokio::spawn(async move {
-        if let Err(e) = run_download(handshaked_peers, registry, dl_state_clone, ui_state_clone, standard_piece_length, total_length, num_pieces, arc_piece_hashes, &output_dir, token).await {
+        if let Err(e) = run_download(handshaked_peers, registry, dl_state_clone, ui_state_clone, standard_piece_length, total_length, num_pieces, arc_piece_hashes, storage_dl, token).await {
             crate::logger::log(&format!("run_download failed: {:?}", e));
         }
     });

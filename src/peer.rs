@@ -1,9 +1,9 @@
 use std::{collections::{HashMap, HashSet}, sync::Arc};
 
-use tokio::{io::{AsyncReadExt, AsyncWriteExt, AsyncSeekExt}, net::TcpStream, sync::Mutex, fs::File};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpStream, sync::Mutex};
 use tokio_util::sync::CancellationToken;
 
-use crate::{download::{DownloadState, download_piece, wait_for_unchoke}, peer, piece::verify_piece};
+use crate::{download::{DownloadState, download_piece, wait_for_unchoke}, piece::verify_piece};
 
 #[derive(Debug)]
 pub enum PeerMessage{
@@ -144,7 +144,7 @@ pub async fn peer_task(
     total_length: u64,
     num_pieces: u32,
     piece_hashes: Arc<Vec<[u8; 20]>>,
-    file: Arc<Mutex<File>>
+    storage: Arc<Mutex<crate::storage::FileEntry>>
 ){
     crate::logger::log(&format!("[{}] - task started", peer_addr));
 
@@ -250,7 +250,7 @@ pub async fn peer_task(
         }
 
         let piece_length = if piece_index == num_pieces - 1 {
-            (total_length - (standard_piece_length* (num_pieces as u64 - 1)))
+            total_length - (standard_piece_length * (num_pieces as u64 - 1))
         } else {
             standard_piece_length
         };
@@ -271,10 +271,9 @@ pub async fn peer_task(
 
                 crate::logger::log(&format!("[{}] piece verified - {}", peer_addr, piece_index));
 
-                let offset = piece_index as u64 * standard_piece_length;
                 {
-                    let mut f = file.lock().await;
-                    if f.seek(std::io::SeekFrom::Start(offset)).await.is_err() || f.write_all(&piece_buf.data).await.is_err(){
+                    let storage_lock = storage.lock().await;
+                    if storage_lock.write_piece(piece_index, standard_piece_length, &piece_buf.data).await.is_err() {
                         crate::logger::log(&format!("[{}] failed to write piece {}", peer_addr, piece_index));
                         let mut state = dl_state.lock().await;
                         state.mark_failed(piece_index);

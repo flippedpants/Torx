@@ -27,9 +27,11 @@ use sha1::{Sha1, Digest};
 use crate::download::BLOCK_SIZE;
 
 //Temporary piece buf (lives during download)
+#[derive(Debug)]
 pub struct PieceBuf{
     pub data: Vec<u8>,
     pub recv_blocks:  Vec<bool>,
+    pub requested_blocks: Vec<bool>,
     pub recv: u64,
     pub num_blocks: u64
 }
@@ -37,7 +39,13 @@ pub struct PieceBuf{
 impl PieceBuf{
     pub fn new(piece_len: u64) -> Self{
         let num_blocks = (piece_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
-        PieceBuf { data: vec![0u8; piece_len as usize], recv_blocks: vec![false; num_blocks as usize], recv: 0, num_blocks }
+        PieceBuf { 
+            data: vec![0u8; piece_len as usize], 
+            recv_blocks: vec![false; num_blocks as usize], 
+            requested_blocks: vec![false; num_blocks as usize],
+            recv: 0, 
+            num_blocks 
+        }
     }
 
     pub fn is_complete(&self) -> bool{

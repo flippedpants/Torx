@@ -118,9 +118,10 @@ pub async fn bit_torrent_handshake(peer: &PeerAddress, peer_id: [u8; 20],info_ha
 pub async fn download_piece(stream: &mut TcpStream,peer_addr: &String, piece_length: u64, piece_index: u32, token: &CancellationToken)-> Result<PieceBuf, Box<dyn std::error::Error + Send + Sync + 'static>> {
 
     let num_blocks = (piece_length + BLOCK_SIZE -1 )/ BLOCK_SIZE;
-    let mut buf = PieceBuf::new(piece_length );
+    let buf = Arc::new(Mutex::new(PieceBuf::new(piece_length)));
 
-    request_blocks(stream, piece_length, piece_index, num_blocks, &buf.recv_blocks).await?;
+    // Initial fill of the pipeline (up to 10)
+    request_blocks(stream, piece_length, piece_index, num_blocks, Arc::clone(&buf), 10).await?;
 
     loop {
         if token.is_cancelled() {
@@ -133,21 +134,36 @@ pub async fn download_piece(stream: &mut TcpStream,peer_addr: &String, piece_len
                 match msg? {
                     PeerMessage::Piece {index, begin, data} => {
                         if index != piece_index {continue;}
-                        buf.add_block(begin, &data);
+                        
+                        let mut b = buf.lock().await;
+                        b.add_block(begin, &data);
 
-                        if buf.is_complete() {
-                            return Ok(buf);
+                        if b.is_complete() {
+                            drop(b);
+                            return Ok(Arc::try_unwrap(buf).unwrap().into_inner());
                         }
+                        drop(b);
+
+                        // Refill the pipeline immediately as soon as we get a block
+                        request_blocks(stream, piece_length, piece_index, num_blocks, Arc::clone(&buf), 10).await?;
                     },
 
                     PeerMessage::Choke => {
                         crate::logger::log(&format!("[{}] choked mid-piece {}", peer_addr, piece_index));
                         wait_for_unchoke(stream).await?;
-                        request_blocks(stream, piece_length, piece_index, num_blocks, &buf.recv_blocks).await?;
+                        
+                        // After unchoke, reset requested status for non-received blocks and refill
+                        {
+                            let mut b = buf.lock().await;
+                            for i in 0..num_blocks as usize {
+                                if !b.recv_blocks[i] {
+                                    b.requested_blocks[i] = false;
+                                }
+                            }
+                        }
+                        request_blocks(stream, piece_length, piece_index, num_blocks, Arc::clone(&buf), 10).await?;
                     },
-                    PeerMessage::Have(i) => {
-                        crate::logger::log(&format!("[{}] have piece {}", peer_addr, i));
-                    },
+                    PeerMessage::Have(_i) => { /* println!("Have piece - {}", i) */ },
                     _ => continue,
 
                 }
@@ -167,8 +183,8 @@ pub async fn wait_for_unchoke(stream: &mut TcpStream) -> Result<(), Box<dyn std:
                 tokio::task::yield_now().await;
                 continue;
             },
-            PeerMessage::Have(i) => { /* println!("Have piece - {}", i) */ },
-            PeerMessage::Bitfield(b) => { /* println!("bitfield: {} bytes", b.len()) */ },
+            PeerMessage::Have(_i) => { /* println!("Have piece - {}", i) */ },
+            PeerMessage::Bitfield(_b) => { /* println!("bitfield: {} bytes", b.len()) */ },
             _ =>{
                 tokio::task::yield_now().await;
                 continue;
@@ -187,27 +203,45 @@ pub async fn wait_for_unchoke(stream: &mut TcpStream) -> Result<(), Box<dyn std:
     }
 }
 
-pub async fn request_blocks(stream: &mut TcpStream, piece_length: u64, piece_index: u32,num_blocks: u64, received_blocks: &[bool]) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>>{
+pub async fn request_blocks(
+    stream: &mut TcpStream, 
+    piece_length: u64, 
+    piece_index: u32,
+    num_blocks: u64, 
+    buf: Arc<Mutex<PieceBuf>>,
+    max_in_flight: usize
+) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+
+    let mut b = buf.lock().await;
+    
+    let in_flight = b.requested_blocks.iter().zip(b.recv_blocks.iter())
+        .filter(|&(&req, &rec)| req && !rec).count();
+    
+    let mut to_request = max_in_flight.saturating_sub(in_flight);
 
     for i in 0..num_blocks {
-        if received_blocks[i as usize] {
+        if to_request == 0 { break; }
+        
+        if b.requested_blocks[i as usize] || b.recv_blocks[i as usize] {
             continue;
         }
 
         let begin = i * BLOCK_SIZE;
-        let length = BLOCK_SIZE.min(piece_length - begin); // last block may be smaller
+        let length = BLOCK_SIZE.min(piece_length - begin);
 
         let mut req = Vec::with_capacity(17);
         req.extend_from_slice(&13u32.to_be_bytes());
         req.push(6);
         req.extend_from_slice(&piece_index.to_be_bytes());
-        req.extend_from_slice(&(begin as u32).to_be_bytes());        // begin and length are u64 but to_be_bytes() on a u64 gives 8 bytes instead of 4. The peer receives a malformed request and either resets or ignores you.
+        req.extend_from_slice(&(begin as u32).to_be_bytes());
         req.extend_from_slice(&(length as u32).to_be_bytes());
+        
         stream.write_all(&req).await?;
-        // println!("Request - {:?}",req );
+        
+        b.requested_blocks[i as usize] = true;
+        to_request -= 1;
     }
     
-    // println!("Sent request");
     Ok(())
 }
 
@@ -220,26 +254,18 @@ pub async fn run_download(
     total_length: u64,
     num_pieces: u32,
     piece_hashes: Arc<Vec<[u8; 20]>>,
-    output_dir: &String,
+    storage: Arc<Mutex<crate::storage::FileEntry>>,
     token: CancellationToken
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
 
-    let file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .open(output_dir)
-        .await?;
-
-    file.set_len(total_length).await?;
-        let file = Arc::new(Mutex::new(file));
-        let mut handles: Vec<tokio::task::JoinHandle<()>> = vec![];
+    let mut handles: Vec<tokio::task::JoinHandle<()>> = vec![];
 
     for (peer_addr, stream) in peers {
             let registry_clone = Arc::clone(&registry);
             let dl_state_clone = Arc::clone(&dl_state);
             let ui_state_clone = Arc::clone(&ui_state);
             let hashes_clone = Arc::clone(&piece_hashes);
-            let file_clone = Arc::clone(&file);
+            let storage_clone = Arc::clone(&storage);
             let token_clone = token.clone(); 
 
             let handle = tokio::spawn(
@@ -254,7 +280,7 @@ pub async fn run_download(
                     total_length,
                     num_pieces,
                     hashes_clone,
-                    file_clone,
+                    storage_clone,
                 )
             );
             handles.push(handle);
