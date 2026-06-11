@@ -70,48 +70,32 @@ impl DownloadState {
 pub async fn bit_torrent_handshake(peer: &PeerAddress, peer_id: [u8; 20],info_hash_bytes: [u8; 20]) -> Result<TcpStream, Box<dyn std::error::Error + Send + Sync + 'static>> {
     
     let handshake = Handshake::new(info_hash_bytes, peer_id);
-    // println!("{:?}", handshake);
     let req_bytes = handshake.serialize();
 
-    // println!("{:?}", peer);
     let addr = format!("{}:{}", peer.ip, peer.port);
 
-    let connection_attempt = TcpStream::connect(&addr);
-
-    match timeout(Duration::from_secs(3), connection_attempt).await {
-        Ok(Ok(mut stream)) => {
-
-            if let Err(e) = stream.write_all(&req_bytes).await {
-                // eprintln!("Failed to write handshake to {}: {}", addr, e);
-                return Err(e.into());
-            }
-
-            let mut handshake_res_buf = [0u8; 68];
-            if let Err(e) = stream.read_exact(&mut handshake_res_buf).await {
-                // eprintln!("Failed to read handshake from {}: {}", addr, e);
-                return Err(e.into());
-            }
-
-
-            if handshake_res_buf[0] != 19 || &handshake_res_buf[1..=19] != b"BitTorrent protocol" {
-                return Err(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Invalid protocol response from {}", addr))));
-            }
-
-            if &handshake_res_buf[28..48] != &info_hash_bytes {
-                return Err(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Info hash mismatch with peer {}", addr))));
-            }
-
-            // println!("Successfully handshaked with {}", addr);
-            return Ok(stream);   
+    let handshake_future = async {
+        let mut stream = TcpStream::connect(&addr).await?;
+        stream.write_all(&req_bytes).await?;
+        
+        let mut handshake_res_buf = [0u8; 68];
+        stream.read_exact(&mut handshake_res_buf).await?;
+        
+        if handshake_res_buf[0] != 19 || &handshake_res_buf[1..=19] != b"BitTorrent protocol" {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Invalid protocol response from {}", addr)));
         }
-        Ok(Err(e)) => {
-            // eprintln!("Connection failed to {}: {}", addr, e);
-            return Err(e.into());
+
+        if &handshake_res_buf[28..48] != &info_hash_bytes {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Info hash mismatch with peer {}", addr)));
         }
-        Err(e) => {
-            // eprintln!("Connection to {} timed out", addr);
-            return Err(e.into());
-        }
+        
+        Ok::<TcpStream, std::io::Error>(stream)
+    };
+
+    match timeout(Duration::from_secs(3), handshake_future).await {
+        Ok(Ok(stream)) => Ok(stream),
+        Ok(Err(e)) => Err(e.into()),
+        Err(_) => Err("Handshake timeout".into())
     }
 }
 
@@ -130,9 +114,9 @@ pub async fn download_piece(stream: &mut TcpStream,peer_addr: &String, piece_len
 
         tokio::select! {
             _ = token.cancelled() => return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "Cancelled"))),
-            msg = read_message(stream) => {
-                match msg? {
-                    PeerMessage::Piece {index, begin, data} => {
+            msg = tokio::time::timeout(Duration::from_secs(15), read_message(stream)) => {
+                match msg {
+                    Ok(Ok(PeerMessage::Piece {index, begin, data})) => {
                         if index != piece_index {continue;}
                         
                         let mut b = buf.lock().await;
@@ -148,7 +132,7 @@ pub async fn download_piece(stream: &mut TcpStream,peer_addr: &String, piece_len
                         request_blocks(stream, piece_length, piece_index, num_blocks, Arc::clone(&buf), 10).await?;
                     },
 
-                    PeerMessage::Choke => {
+                    Ok(Ok(PeerMessage::Choke)) => {
                         crate::logger::log(&format!("[{}] choked mid-piece {}", peer_addr, piece_index));
                         wait_for_unchoke(stream).await?;
                         
@@ -163,9 +147,10 @@ pub async fn download_piece(stream: &mut TcpStream,peer_addr: &String, piece_len
                         }
                         request_blocks(stream, piece_length, piece_index, num_blocks, Arc::clone(&buf), 10).await?;
                     },
-                    PeerMessage::Have(_i) => { /* println!("Have piece - {}", i) */ },
-                    _ => continue,
-
+                    Ok(Ok(PeerMessage::Have(_i))) => { /* println!("Have piece - {}", i) */ },
+                    Ok(Ok(_)) => continue,
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => return Err(Box::new(std::io::Error::new(std::io::ErrorKind::TimedOut, "Piece download timed out"))),
                 }
             }
         }

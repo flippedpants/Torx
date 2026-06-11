@@ -131,28 +131,101 @@ pub fn generate_id() -> String{
     peer_id
 }
 
-pub fn build_http_url(file_content: &parser::Torrent, torrent_file: &Vec<u8>, peer_id: &str) -> String{
-    let info_hash_hex = calculate_info_hash(torrent_file).unwrap();
+use tokio::net::UdpSocket;
+use std::time::Duration;
+use tokio::time::timeout;
+use std::collections::HashSet;
+use crate::response::PeerAddress;
 
-    const PORT: i32 = 6881;
-
-    // let announce_url = find_https_tracker(&file_content.announce_list).unwrap();
-    // let announce_url = file_content.announce.clone(); 
-    let announce_url = "https://tracker.zhuqiy.com:443/announce".to_string(); 
+pub async fn request_udp_tracker(url_str: &str, info_hash: &[u8; 20], peer_id_str: &str, total_length: u64) -> Result<Vec<PeerAddress>, Box<dyn std::error::Error + Send + Sync>> {
+    let parsed_url = reqwest::Url::parse(url_str)?;
+    let host = parsed_url.host_str().ok_or("No host")?;
+    let port = parsed_url.port().unwrap_or(80);
     
-    let encoded_info_hash: String = hash_encoding(info_hash_hex.0);
-    let peer_id = peer_id;
-    let uploaded = 0;
-    let downloaded = 0;
-    let downloading_left = calculate_torrent_size(file_content);
-    let compact = 1;
+    let addr = format!("{}:{}", host, port);
+    let mut addrs = tokio::net::lookup_host(&addr).await?;
+    let target_addr = addrs.next().ok_or("DNS resolution failed")?;
+
+    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    socket.connect(target_addr).await?;
+
+    let transaction_id: u32 = rand::random();
     
-    let url = format!("{}?info_hash={}&peer_id={}&port={}&uploaded={}&downloaded={}&left={:?}&compact={}&numwant=200",
-                                announce_url,encoded_info_hash,peer_id,PORT,uploaded,downloaded,downloading_left,compact);
+    let mut connect_req = Vec::with_capacity(16);
+    connect_req.extend_from_slice(&0x41727101980u64.to_be_bytes());
+    connect_req.extend_from_slice(&0u32.to_be_bytes()); 
+    connect_req.extend_from_slice(&transaction_id.to_be_bytes());
+    
+    socket.send(&connect_req).await?;
+    
+    let mut connect_res = [0u8; 16];
+    timeout(Duration::from_secs(5), socket.recv(&mut connect_res)).await??;
+    
+    let action = u32::from_be_bytes(connect_res[0..4].try_into()?);
+    if action != 0 {
+        return Err("Invalid connect action".into());
+    }
+    let res_trans_id = u32::from_be_bytes(connect_res[4..8].try_into()?);
+    if res_trans_id != transaction_id {
+        return Err("Transaction ID mismatch".into());
+    }
+    let connection_id = u64::from_be_bytes(connect_res[8..16].try_into()?);
 
-    // println!("{}", url);
-
-    url
+    let announce_trans_id: u32 = rand::random();
+    let mut announce_req = Vec::with_capacity(98);
+    announce_req.extend_from_slice(&connection_id.to_be_bytes());
+    announce_req.extend_from_slice(&1u32.to_be_bytes()); 
+    announce_req.extend_from_slice(&announce_trans_id.to_be_bytes());
+    announce_req.extend_from_slice(info_hash);
+    
+    let mut peer_id_bytes = [0u8; 20];
+    let pid_bytes = peer_id_str.as_bytes();
+    let len = pid_bytes.len().min(20);
+    peer_id_bytes[..len].copy_from_slice(&pid_bytes[..len]);
+    announce_req.extend_from_slice(&peer_id_bytes);
+    
+    announce_req.extend_from_slice(&0u64.to_be_bytes()); 
+    announce_req.extend_from_slice(&total_length.to_be_bytes()); 
+    announce_req.extend_from_slice(&0u64.to_be_bytes()); 
+    announce_req.extend_from_slice(&0u32.to_be_bytes()); 
+    announce_req.extend_from_slice(&0u32.to_be_bytes()); 
+    let key: u32 = rand::random();
+    announce_req.extend_from_slice(&key.to_be_bytes()); 
+    announce_req.extend_from_slice(&(-1i32).to_be_bytes()); 
+    announce_req.extend_from_slice(&6881u16.to_be_bytes()); 
+    
+    socket.send(&announce_req).await?;
+    
+    let mut announce_res = [0u8; 8192];
+    let len = timeout(Duration::from_secs(10), socket.recv(&mut announce_res)).await??;
+    
+    if len < 20 {
+        return Err("Announce response too short".into());
+    }
+    
+    let res_action = u32::from_be_bytes(announce_res[0..4].try_into()?);
+    if res_action == 3 {
+        let msg = String::from_utf8_lossy(&announce_res[8..len]);
+        return Err(format!("Tracker error: {}", msg).into());
+    }
+    if res_action != 1 {
+        return Err("Invalid announce action".into());
+    }
+    let res_trans_id2 = u32::from_be_bytes(announce_res[4..8].try_into()?);
+    if res_trans_id2 != announce_trans_id {
+        return Err("Transaction ID mismatch on announce".into());
+    }
+    
+    let mut peers = Vec::new();
+    let mut i = 20;
+    while i + 6 <= len {
+        let ip = format!("{}.{}.{}.{}", announce_res[i], announce_res[i+1], announce_res[i+2], announce_res[i+3]);
+        let port = u16::from_be_bytes([announce_res[i+4], announce_res[i+5]]);
+        peers.push(PeerAddress { ip, port });
+        i += 6;
+    }
+    
+    Ok(peers)
 }
 
 fn hash_encoding(text: String) -> String{
@@ -171,18 +244,86 @@ fn hash_encoding(text: String) -> String{
     encoded_text
 }
 
-pub fn find_https_tracker(announce_list: &Option<Vec<Vec<String>>>) -> Option<String> {
-    if let Some(trackers) = announce_list {
-
-        for tier in trackers {
-            for tracker in tier {
-
-                if tracker.starts_with("https://") {
-                    return Some(tracker.clone());
-                }
-
+pub async fn collect_all_peers(
+    file_content: &parser::Torrent, 
+    torrent_file: &Vec<u8>, 
+    peer_id: &str
+) -> Result<Vec<PeerAddress>, Box<dyn std::error::Error + Send + Sync>> {
+    
+    let (total_length, _) = calculate_torrent_size(file_content);
+    let info_hash = calculate_info_hash(torrent_file)?;
+    
+    let mut urls = Vec::new();
+    urls.push(file_content.announce.clone());
+    
+    if let Some(list) = &file_content.announce_list {
+        for tier in list {
+            for url in tier {
+                urls.push(url.clone());
             }
         }
     }
-    None
+    
+    let mut unique_urls = HashSet::new();
+    let mut final_urls = Vec::new();
+    for url in urls {
+        if unique_urls.insert(url.clone()) {
+            final_urls.push(url);
+            if final_urls.len() >= 10 {
+                break;
+            }
+        }
+    }
+    
+    let mut all_peers = HashSet::new();
+    let http_client = reqwest::Client::new();
+    
+    for url in final_urls {
+        crate::logger::log(&format!("[SYSTEM] Announcing to tracker: {}", url));
+        println!("Querying tracker: {}", url);
+        
+        if url.starts_with("http://") || url.starts_with("https://") {
+            let encoded_info_hash = hash_encoding(info_hash.0.clone());
+            let request_url = format!("{}?info_hash={}&peer_id={}&port=6881&uploaded=0&downloaded=0&left={}&compact=1&numwant=200",
+                                url, encoded_info_hash, peer_id, total_length);
+            
+            if let Ok(response) = http_client.get(&request_url).timeout(Duration::from_secs(5)).send().await {
+                if let Ok(bytes) = response.bytes().await {
+                    match crate::response::parse_response(&bytes) {
+                        Ok(peers) => {
+                            for peer in peers {
+                                all_peers.insert(peer);
+                            }
+                        }
+                        Err(e) => {
+                            crate::logger::log(&format!("[SYSTEM] HTTP Tracker error parsing response: {}", e));
+                            println!("HTTP Tracker error: {}", e);
+                        }
+                    }
+                } else {
+                    crate::logger::log("[SYSTEM] Failed to read HTTP tracker response bytes");
+                    println!("Failed to read HTTP tracker response bytes");
+                }
+            } else {
+                crate::logger::log("[SYSTEM] HTTP Tracker request failed or timed out");
+                println!("HTTP Tracker request failed or timed out");
+            }
+        } else if url.starts_with("udp://") {
+            match request_udp_tracker(&url, &info_hash.1, peer_id, total_length).await {
+                Ok(peers) => {
+                    for peer in peers {
+                        all_peers.insert(peer);
+                    }
+                }
+                Err(e) => {
+                    crate::logger::log(&format!("[SYSTEM] UDP Tracker error: {}", e));
+                    println!("UDP Tracker error: {}", e);
+                }
+            }
+        }
+        
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    
+    Ok(all_peers.into_iter().collect())
 }

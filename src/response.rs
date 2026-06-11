@@ -4,60 +4,48 @@ use serde::{Deserialize, Serialize};
 pub struct Response{
     #[serde(rename="failure reason")]
     failure_reason: Option<String>,
-    interval: u32,
+    interval: Option<u32>,
 
     #[serde(rename="min interval")]
     min_interval: Option<u32>,
 
     #[serde(rename="tracker id")]
     tracker_id: Option<String>,
-    complete: i32,
-    incomplete: i32,
+    complete: Option<i32>,
+    incomplete: Option<i32>,
 
-    #[serde(with = "serde_bytes")]
-    peers: Vec<u8>
+    #[serde(with = "serde_bytes", default)]
+    peers: Option<Vec<u8>>
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct PeerAddress{
     pub ip: String,
     pub port: u16
 }
 
-pub fn parse_response(response_byte: &bytes::Bytes) -> Vec<PeerAddress>{
-    let res: Response = serde_bencode::from_bytes(response_byte).unwrap();
-    // println!("seeders: {:?}, leechers: {:?}", res.complete, res.incomplete);
-
-    // println!("{:?}", response);
-
-    let mut peer_list: Vec<PeerAddress> = vec![];
-    let mut i = 0;
-
-    while i < res.peers.len(){
-
-        let peer_slice = &res.peers[i..=i+5];
-        let peer: [u8; 6] = peer_slice.try_into().expect("peer with invalid address");
-
-        let ip_byte = &peer[..=3];
-        let port_values = &peer[4..=5];
-
-        // let ip = ip_byte.iter()
-        //     .map(|byte| byte.to_string())
-        //     .collect::<Vec<String>>()
-        //     .join(".");
-
-        let ip = format!("{}.{}.{}.{}", ip_byte[0], ip_byte[1], ip_byte[2], ip_byte[3]);
-        let port = (port_values[0] as u16) * 256 + (port_values[1] as u16); 
-        
-        peer_list.push(PeerAddress { ip, port });
-
-        i += 6;
+pub fn parse_response(response_byte: &bytes::Bytes) -> Result<Vec<PeerAddress>, Box<dyn std::error::Error + Send + Sync>> {
+    let res: Response = serde_bencode::from_bytes(response_byte)?;
+    
+    if let Some(reason) = res.failure_reason {
+        return Err(format!("Tracker failure reason: {}", reason).into());
     }
 
-    // println!("{:#?}", peer_list);
-    // println!("{}", peer_list.len());
+    let mut peer_list: Vec<PeerAddress> = vec![];
+    
+    if let Some(peers) = res.peers {
+        let mut i = 0;
+        while i + 6 <= peers.len() {
+            let peer_slice = &peers[i..=i+5];
+            let ip = format!("{}.{}.{}.{}", peer_slice[0], peer_slice[1], peer_slice[2], peer_slice[3]);
+            let port = (peer_slice[4] as u16) * 256 + (peer_slice[5] as u16); 
+            
+            peer_list.push(PeerAddress { ip, port });
+            i += 6;
+        }
+    }
 
-    peer_list
+    Ok(peer_list)
 }   
 
 // use serde::{Deserialize, Serialize};

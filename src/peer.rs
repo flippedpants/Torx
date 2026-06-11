@@ -143,36 +143,38 @@ pub async fn peer_task(
 ){
     crate::logger::log(&format!("[{}] - task started", peer_addr));
 
-    loop{
-        tokio::select! {
-            _ = token.cancelled() => {
-                let _ = ui_tx.send(crate::ui::UiUpdate::ActivePeers(-1)).await;
-                return;
-            },
-            msg = read_message(&mut stream) => {
-                match msg {
-                    Ok(PeerMessage::Bitfield(b)) => {
-                        let mut reg = registry.lock().await;
-                        reg.set_bitfield(&peer_addr, &b);
-                        break;
-                    }
-                    Ok(PeerMessage::Have(i)) => {
-                        let mut reg = registry.lock().await;
-                        reg.set_have(&peer_addr, i);
-                    }
-                    Ok(PeerMessage::Unchoke) =>{
-                        break;
-                    }
-                    Ok(_) => continue,
-                    Err(e) => {
-                        crate::logger::log(&format!("[{}] error during init - {}", peer_addr, e));
-                        let _ = ui_tx.send(crate::ui::UiUpdate::ActivePeers(-1)).await;
-                        return;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop{
+            tokio::select! {
+                _ = token.cancelled() => {
+                    let _ = ui_tx.send(crate::ui::UiUpdate::ActivePeers(-1)).await;
+                    return;
+                },
+                msg = read_message(&mut stream) => {
+                    match msg {
+                        Ok(PeerMessage::Bitfield(b)) => {
+                            let mut reg = registry.lock().await;
+                            reg.set_bitfield(&peer_addr, &b);
+                            break;
+                        }
+                        Ok(PeerMessage::Have(i)) => {
+                            let mut reg = registry.lock().await;
+                            reg.set_have(&peer_addr, i);
+                        }
+                        Ok(PeerMessage::Unchoke) =>{
+                            break;
+                        }
+                        Ok(_) => continue,
+                        Err(e) => {
+                            crate::logger::log(&format!("[{}] error during init - {}", peer_addr, e));
+                            let _ = ui_tx.send(crate::ui::UiUpdate::ActivePeers(-1)).await;
+                            return;
+                        }
                     }
                 }
             }
         }
-    }
+    }).await;
 
     if stream.write_all(&[0,0,0,1,2]).await.is_err() {
         crate::logger::log(&format!("Could not send interested to [{}]", peer_addr));
@@ -282,6 +284,7 @@ pub async fn peer_task(
                         std::io::ErrorKind::ConnectionReset | 
                         std::io::ErrorKind::ConnectionAborted |
                         std::io::ErrorKind::UnexpectedEof |
+                        std::io::ErrorKind::TimedOut |
                         std::io::ErrorKind::NotConnected)
                 } else {
                     false

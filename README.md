@@ -8,4 +8,4 @@
 - [x] Connect to multiple peers concurently
 - [x] Track pieces
 - [ ] Handle other peers piece requests
-- [ ] implement udp tracker request
+- [x] implement udp tracker request
