@@ -114,7 +114,7 @@ pub async fn download_piece(stream: &mut TcpStream,peer_addr: &String, piece_len
 
         tokio::select! {
             _ = token.cancelled() => return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "Cancelled"))),
-            msg = tokio::time::timeout(Duration::from_secs(15), read_message(stream)) => {
+            msg = tokio::time::timeout(Duration::from_secs(45), read_message(stream)) => {
                 match msg {
                     Ok(Ok(PeerMessage::Piece {index, begin, data})) => {
                         if index != piece_index {continue;}
@@ -231,7 +231,9 @@ pub async fn request_blocks(
 }
 
 pub async fn run_download(
-    peers: Vec<(String, TcpStream)>,
+    peers: Vec<PeerAddress>,
+    peer_id: [u8; 20],
+    info_hash: [u8; 20],
     registry: Arc<Mutex<PeerRegistry>>,
     dl_state: Arc<Mutex<DownloadState>>,
     standard_piece_length: u64,
@@ -243,37 +245,66 @@ pub async fn run_download(
     token: CancellationToken
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
 
+    let peers_queue = Arc::new(Mutex::new(peers));
     let mut handles: Vec<tokio::task::JoinHandle<()>> = vec![];
 
-    for (peer_addr, stream) in peers {
-            let registry_clone = Arc::clone(&registry);
-            let dl_state_clone = Arc::clone(&dl_state);
-            let hashes_clone = Arc::clone(&piece_hashes);
-            let storage_clone = Arc::clone(&storage);
-            let ui_tx_clone = ui_tx.clone();
-            let token_clone = token.clone(); 
+    let num_workers = 50; // Max concurrent connections
 
-            let handle = tokio::spawn(
-                peer_task(
-                    peer_addr,
-                    stream, 
-                    registry_clone,
-                    dl_state_clone,
-                    token_clone,
-                    standard_piece_length,
-                    total_length,
-                    num_pieces,
-                    hashes_clone,
-                    storage_clone,
-                    ui_tx_clone,
-                )
-            );
-            handles.push(handle);
-        }
+    for _ in 0..num_workers {
+        let queue_clone = Arc::clone(&peers_queue);
+        let registry_clone = Arc::clone(&registry);
+        let dl_state_clone = Arc::clone(&dl_state);
+        let hashes_clone = Arc::clone(&piece_hashes);
+        let storage_clone = Arc::clone(&storage);
+        let ui_tx_clone = ui_tx.clone();
+        let token_clone = token.clone(); 
+        
+        let handle = tokio::spawn(async move {
+            loop {
+                if token_clone.is_cancelled() { break; }
+                
+                let peer_opt = {
+                    let mut q = queue_clone.lock().await;
+                    q.pop()
+                };
+                
+                let Some(peer) = peer_opt else {
+                    // Queue empty, worker exits
+                    break;
+                };
 
-        for handle in handles{
-            let _ = handle.await;
-        }
+                let peer_addr = format!("{}:{}", peer.ip, peer.port);
+                
+                match bit_torrent_handshake(&peer, peer_id, info_hash).await {
+                    Ok(stream) => {
+                        let _ = ui_tx_clone.send(crate::ui::UiUpdate::ActivePeers(1)).await;
+                        crate::peer::peer_task(
+                            peer_addr,
+                            stream, 
+                            Arc::clone(&registry_clone),
+                            Arc::clone(&dl_state_clone),
+                            token_clone.clone(),
+                            standard_piece_length,
+                            total_length,
+                            num_pieces,
+                            Arc::clone(&hashes_clone),
+                            Arc::clone(&storage_clone),
+                            ui_tx_clone.clone(),
+                        ).await;
+                    }
+                    Err(_) => {
+                        // Handshake failed, loop around to pop another peer
+                        continue;
+                    }
+                }
+            }
+        });
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        let _ = handle.await;
+    }
 
     Ok(())
 }

@@ -17,7 +17,7 @@ use crate::{download::{DownloadState, bit_torrent_handshake, run_download}, peer
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-    let torrent_file = fs::read("/home/daksh/Downloads/Resident Evil 7 - Biohazard [FitGirl Repack].torrent").unwrap();
+    let torrent_file = fs::read("/home/daksh/Downloads/ubuntu-26.04-desktop-amd64.iso.torrent").unwrap();
 
     let file_content: Torrent = serde_bencode::from_bytes(&torrent_file).unwrap();
     
@@ -33,32 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
     let peer_id_bytes: [u8; 20] = peer_id.as_bytes().try_into().expect("Length Mismatch");
     let info_hash_bytes = info_hash.1;
 
-    println!("Found {} peers! Handshaking and connecting... (this may take up to 20 seconds depending on peer response times)", peers.len());
-
-    let mut handles = vec![];
-    let mut count = 0;
-    for peer in peers {
-        count +=1;
-        let handle = tokio::spawn(async move {
-            match bit_torrent_handshake(&peer, peer_id_bytes, info_hash_bytes).await {
-                Ok(stream) => {Some((format!("{}:{}", peer.ip, peer.port), stream))},
-                Err(_e) => {
-                    eprintln!("{}", _e);
-                    println!("{}", count);
-                    None
-                }
-            }
-        });
-        handles.push(handle);
-    }
-
-    let mut handshaked_peers: Vec<(String, TcpStream)> = vec![];
-    for handle in handles {
-        if let Ok(Some(peer_data)) = handle.await {
-            
-            handshaked_peers.push(peer_data);
-        }
-    }
+    println!("Found {} peers! Starting connection worker pool...", peers.len());
 
     let mut piece_hashes: Vec<[u8; 20]> = vec![];
     for piece in pieces_split{
@@ -72,10 +47,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
     let dl_state = Arc::new(Mutex::new(DownloadState::new(num_pieces)));
     let arc_piece_hashes = Arc::new(piece_hashes);
     let single_file_name = file_content.info.name.clone();
-
-    // println!("got required data");
-
-    let active_peers = handshaked_peers.len();
 
     let mut file_names = vec![];
     match &file_content.info.mode {
@@ -93,10 +64,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
         needed_count: num_pieces as usize,
         total_pieces: num_pieces,
         complete: false,
-        active_peers,
+        active_peers: 0,
         active_tab: ui::AppTab::Overview,
         pieces: vec![ui::PieceStatus::Missing; num_pieces as usize],
-        logs: vec!["[SYSTEM] Torx client initialized".to_string(), format!("[SYSTEM] Found {} handshaked peers", active_peers)],
+        logs: vec!["[SYSTEM] Torx client initialized".to_string()],
         peers: vec![],
         file_names,
     }));
@@ -118,7 +89,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
     let ui_tx_dl = ui_tx.clone();
     let download_handle = tokio::spawn(async move {
         if let Err(e) = run_download(
-            handshaked_peers, 
+            peers, 
+            peer_id_bytes,
+            info_hash_bytes,
             registry, 
             dl_state_clone, 
             standard_piece_length, 

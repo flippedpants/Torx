@@ -182,6 +182,20 @@ pub async fn peer_task(
         return;
     }
 
+    tokio::select! {
+        _ = token.cancelled() => {
+            let _ = ui_tx.send(crate::ui::UiUpdate::ActivePeers(-1)).await;
+            return;
+        }
+        result = crate::download::wait_for_unchoke(&mut stream) => {
+            if result.is_err() {
+                crate::logger::log(&format!("[{}] - unchoke timeout", peer_addr));
+                let _ = ui_tx.send(crate::ui::UiUpdate::ActivePeers(-1)).await;
+                return;
+            }
+        }
+    }
+
     // Upsert peer info initially
     let _ = ui_tx.send(crate::ui::UiUpdate::PeerStats {
         ip: peer_addr.clone(),
