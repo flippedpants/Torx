@@ -4,7 +4,7 @@ use std::time::Duration;
 use tokio::{io::{AsyncWriteExt, AsyncReadExt}, net::TcpStream, time::timeout};
 use tokio_util::sync::CancellationToken;
 
-use crate::{peer::{PeerMessage, PeerRegistry, peer_task, read_message}, piece::PieceBuf, response::PeerAddress};
+use crate::{peer::{PeerMessage, PeerRegistry, read_message}, piece::PieceBuf, response::PeerAddress};
 
 pub const BLOCK_SIZE: u64 = 16384;
 
@@ -38,6 +38,7 @@ pub struct DownloadState {
     pub in_progress: HashSet<u32>,
     pub num_pieces: u32,
     pub downloaded_bytes: u64,
+    pub uploaded_bytes: u64,
     pub active_peers: u32,
 }   
 
@@ -48,6 +49,7 @@ impl DownloadState {
             in_progress: HashSet::new(),
             num_pieces,
             downloaded_bytes: 0,
+            uploaded_bytes: 0,
             active_peers: 0,
         }
     }
@@ -66,6 +68,19 @@ impl DownloadState {
         self.in_progress.insert(piece_index);
     }
 }   
+
+/// Build a BitTorrent-spec bitfield from the needed array.
+/// A set bit means we HAVE that piece (inverse of needed).
+pub fn build_bitfield(needed: &[bool]) -> Vec<u8> {
+    let num_bytes = (needed.len() + 7) / 8;
+    let mut bitfield = vec![0u8; num_bytes];
+    for (i, &is_needed) in needed.iter().enumerate() {
+        if !is_needed {
+            bitfield[i / 8] |= 1 << (7 - (i % 8));
+        }
+    }
+    bitfield
+}
 
 pub async fn bit_torrent_handshake(peer: &PeerAddress, peer_id: [u8; 20],info_hash_bytes: [u8; 20]) -> Result<TcpStream, Box<dyn std::error::Error + Send + Sync + 'static>> {
     
@@ -103,9 +118,10 @@ pub async fn download_piece(stream: &mut TcpStream,peer_addr: &String, piece_len
 
     let num_blocks = (piece_length + BLOCK_SIZE -1 )/ BLOCK_SIZE;
     let buf = Arc::new(Mutex::new(PieceBuf::new(piece_length)));
+    let pipeline_depth = 50;
 
-    // Initial fill of the pipeline (up to 10)
-    request_blocks(stream, piece_length, piece_index, num_blocks, Arc::clone(&buf), 10).await?;
+    // Initial fill of the pipeline
+    request_blocks(stream, piece_length, piece_index, num_blocks, Arc::clone(&buf), pipeline_depth).await?;
 
     loop {
         if token.is_cancelled() {
@@ -129,7 +145,7 @@ pub async fn download_piece(stream: &mut TcpStream,peer_addr: &String, piece_len
                         drop(b);
 
                         // Refill the pipeline immediately as soon as we get a block
-                        request_blocks(stream, piece_length, piece_index, num_blocks, Arc::clone(&buf), 10).await?;
+                        request_blocks(stream, piece_length, piece_index, num_blocks, Arc::clone(&buf), pipeline_depth).await?;
                     },
 
                     Ok(Ok(PeerMessage::Choke)) => {
@@ -145,7 +161,7 @@ pub async fn download_piece(stream: &mut TcpStream,peer_addr: &String, piece_len
                                 }
                             }
                         }
-                        request_blocks(stream, piece_length, piece_index, num_blocks, Arc::clone(&buf), 10).await?;
+                        request_blocks(stream, piece_length, piece_index, num_blocks, Arc::clone(&buf), pipeline_depth).await?;
                     },
                     Ok(Ok(PeerMessage::Have(_i))) => { /* println!("Have piece - {}", i) */ },
                     Ok(Ok(_)) => continue,
@@ -242,7 +258,9 @@ pub async fn run_download(
     piece_hashes: Arc<Vec<[u8; 20]>>,
     storage: Arc<crate::storage::FileEntry>,
     ui_tx: tokio::sync::mpsc::Sender<crate::ui::UiUpdate>,
-    token: CancellationToken
+    token: CancellationToken,
+    upload_mgr: Arc<Mutex<crate::upload::UploadManager>>,
+    have_tx: tokio::sync::broadcast::Sender<u32>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
 
     let peers_queue = Arc::new(Mutex::new(peers));
@@ -257,7 +275,9 @@ pub async fn run_download(
         let hashes_clone = Arc::clone(&piece_hashes);
         let storage_clone = Arc::clone(&storage);
         let ui_tx_clone = ui_tx.clone();
-        let token_clone = token.clone(); 
+        let token_clone = token.clone();
+        let upload_mgr_clone = Arc::clone(&upload_mgr);
+        let have_tx_clone = have_tx.clone();
         
         let handle = tokio::spawn(async move {
             loop {
@@ -290,6 +310,8 @@ pub async fn run_download(
                             Arc::clone(&hashes_clone),
                             Arc::clone(&storage_clone),
                             ui_tx_clone.clone(),
+                            Arc::clone(&upload_mgr_clone),
+                            have_tx_clone.clone(),
                         ).await;
                     }
                     Err(_) => {

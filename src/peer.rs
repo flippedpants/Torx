@@ -139,7 +139,9 @@ pub async fn peer_task(
     num_pieces: u32,
     piece_hashes: Arc<Vec<[u8; 20]>>,
     storage: Arc<crate::storage::FileEntry>,
-    ui_tx: tokio::sync::mpsc::Sender<crate::ui::UiUpdate>
+    ui_tx: tokio::sync::mpsc::Sender<crate::ui::UiUpdate>,
+    upload_mgr: Arc<Mutex<crate::upload::UploadManager>>,
+    have_tx: tokio::sync::broadcast::Sender<u32>,
 ){
     crate::logger::log(&format!("[{}] - task started", peer_addr));
 
@@ -175,6 +177,22 @@ pub async fn peer_task(
             }
         }
     }).await;
+
+    // Send our bitfield so the peer knows what we have
+    {
+        let state = dl_state.lock().await;
+        let bitfield = crate::download::build_bitfield(&state.needed);
+        let bf_len = (1 + bitfield.len()) as u32;
+        let mut bf_msg = Vec::with_capacity(4 + 1 + bitfield.len());
+        bf_msg.extend_from_slice(&bf_len.to_be_bytes());
+        bf_msg.push(5);
+        bf_msg.extend_from_slice(&bitfield);
+        if stream.write_all(&bf_msg).await.is_err() {
+            crate::logger::log(&format!("[{}] failed to send bitfield", peer_addr));
+            let _ = ui_tx.send(crate::ui::UiUpdate::ActivePeers(-1)).await;
+            return;
+        }
+    }
 
     if stream.write_all(&[0,0,0,1,2]).await.is_err() {
         crate::logger::log(&format!("Could not send interested to [{}]", peer_addr));
@@ -221,10 +239,9 @@ pub async fn peer_task(
         };
 
         let Some(piece_index) = piece_index else{
-            crate::logger::log(&format!("[{}] no more pieces to download", peer_addr));
-            let _ = ui_tx.send(crate::ui::UiUpdate::Log(format!("[SYSTEM] Peer {} disconnected (no more pieces)", peer_addr))).await;
-            let _ = ui_tx.send(crate::ui::UiUpdate::ActivePeers(-1)).await;
-            return;
+            crate::logger::log(&format!("[{}] no more pieces to download, entering serve mode", peer_addr));
+            let _ = ui_tx.send(crate::ui::UiUpdate::Log(format!("[SYSTEM] Peer {} entering serve mode", peer_addr))).await;
+            break;
         };
 
         {
@@ -267,6 +284,7 @@ pub async fn peer_task(
                     let mut state = dl_state.lock().await;
                     state.mark_done(piece_index);
                     state.downloaded_bytes += piece_length as u64;
+                    let _ = have_tx.send(piece_index);
 
                     let _ = ui_tx.send(crate::ui::UiUpdate::DownloadedBytes(state.downloaded_bytes)).await;
                     let _ = ui_tx.send(crate::ui::UiUpdate::PieceStatus(piece_index, crate::ui::PieceStatus::Complete)).await;
@@ -281,10 +299,9 @@ pub async fn peer_task(
                     }).await;
 
                     if state.is_complete() {
-                        token.cancel();
-                        let _ = ui_tx.send(crate::ui::UiUpdate::Log("[SYSTEM] Download complete!".to_string())).await;
-                        let _ = ui_tx.send(crate::ui::UiUpdate::ActivePeers(-1)).await;
-                        return;
+                        let _ = ui_tx.send(crate::ui::UiUpdate::Log("[SYSTEM] Download complete! Entering seed mode.".to_string())).await;
+                        drop(state);
+                        break;
                     }
                 }
             }
@@ -320,4 +337,19 @@ pub async fn peer_task(
             }
         }
     }
+
+    // Transition to serve mode — keep the connection alive and serve pieces
+    crate::logger::log(&format!("[{}] transitioning to serve mode", peer_addr));
+    crate::upload::serve_peer(
+        &mut stream,
+        &peer_addr,
+        &dl_state,
+        &upload_mgr,
+        &storage,
+        standard_piece_length,
+        &have_tx,
+        &ui_tx,
+        &token,
+    ).await;
+    let _ = ui_tx.send(crate::ui::UiUpdate::ActivePeers(-1)).await;
 }

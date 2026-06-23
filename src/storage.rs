@@ -96,4 +96,47 @@ impl FileEntry {
         }
         Ok(())
     }
+
+    /// Read a block of data from a piece, handling multi-file boundaries.
+    /// This is the inverse of write_piece, used for serving upload requests.
+    pub async fn read_block(
+        &self,
+        piece_index: u32,
+        standard_piece_length: u64,
+        begin: u64,
+        length: u64,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+        let piece_start = piece_index as u64 * standard_piece_length;
+        let block_start = piece_start + begin;
+        let block_end = block_start + length;
+
+        let mut data = vec![0u8; length as usize];
+
+        for file in &self.files {
+            let file_start = file.offset;
+            let file_end = file.offset + file.length;
+
+            if block_end <= file_start || block_start >= file_end {
+                continue;
+            }
+
+            let overlap_start = block_start.max(file_start);
+            let overlap_end = block_end.min(file_end);
+
+            let data_start = (overlap_start - block_start) as usize;
+            let data_end = (overlap_end - block_start) as usize;
+            let file_offset = overlap_start - file_start;
+
+            let mut f = tokio::fs::OpenOptions::new()
+                .read(true)
+                .open(&file.path)
+                .await?;
+
+            use tokio::io::{AsyncSeekExt, AsyncReadExt};
+            f.seek(std::io::SeekFrom::Start(file_offset)).await?;
+            f.read_exact(&mut data[data_start..data_end]).await?;
+        }
+
+        Ok(data)
+    }
 }

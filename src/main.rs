@@ -11,13 +11,13 @@ mod storage;
 use std::{fs::{self}, sync::Arc};
 use parser::Torrent;
 use build_request::{calculate_info_hash, split_pieces, calculate_torrent_size, generate_id, collect_all_peers};
-use tokio::{net::TcpStream, sync::Mutex};
+use tokio::{sync::Mutex};
 
-use crate::{download::{DownloadState, bit_torrent_handshake, run_download}, peer::PeerRegistry};
+use crate::{download::{DownloadState,run_download}, peer::PeerRegistry};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-    let torrent_file = fs::read("/home/daksh/Downloads/ubuntu-26.04-desktop-amd64.iso.torrent").unwrap();
+    let torrent_file = fs::read("/home/daksh/Downloads/big-buck-bunny.torrent").unwrap();
 
     let file_content: Torrent = serde_bencode::from_bytes(&torrent_file).unwrap();
     
