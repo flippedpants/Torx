@@ -114,14 +114,16 @@ pub async fn bit_torrent_handshake(peer: &PeerAddress, peer_id: [u8; 20],info_ha
     }
 }
 
-pub async fn download_piece(stream: &mut TcpStream,peer_addr: &String, piece_length: u64, piece_index: u32, token: &CancellationToken)-> Result<PieceBuf, Box<dyn std::error::Error + Send + Sync + 'static>> {
+pub async fn download_piece(stream: &mut TcpStream,peer_addr: &String, piece_length: u64, piece_index: u32, token: &CancellationToken, registry: &Arc<Mutex<PeerRegistry>>)-> Result<PieceBuf, Box<dyn std::error::Error + Send + Sync + 'static>> {
 
     let num_blocks = (piece_length + BLOCK_SIZE -1 )/ BLOCK_SIZE;
     let buf = Arc::new(Mutex::new(PieceBuf::new(piece_length)));
-    let pipeline_depth = 50;
+    let pipeline_depth = 250;
 
     // Initial fill of the pipeline
     request_blocks(stream, piece_length, piece_index, num_blocks, Arc::clone(&buf), pipeline_depth).await?;
+
+    let mut timeout_count = 0;
 
     loop {
         if token.is_cancelled() {
@@ -130,9 +132,10 @@ pub async fn download_piece(stream: &mut TcpStream,peer_addr: &String, piece_len
 
         tokio::select! {
             _ = token.cancelled() => return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "Cancelled"))),
-            msg = tokio::time::timeout(Duration::from_secs(45), read_message(stream)) => {
+            msg = tokio::time::timeout(Duration::from_secs(5), read_message(stream)) => {
                 match msg {
                     Ok(Ok(PeerMessage::Piece {index, begin, data})) => {
+                        timeout_count = 0;
                         if index != piece_index {continue;}
                         
                         let mut b = buf.lock().await;
@@ -149,8 +152,9 @@ pub async fn download_piece(stream: &mut TcpStream,peer_addr: &String, piece_len
                     },
 
                     Ok(Ok(PeerMessage::Choke)) => {
+                        timeout_count = 0;
                         crate::logger::log(&format!("[{}] choked mid-piece {}", peer_addr, piece_index));
-                        wait_for_unchoke(stream).await?;
+                        wait_for_unchoke(stream, peer_addr, registry).await?;
                         
                         // After unchoke, reset requested status for non-received blocks and refill
                         {
@@ -163,18 +167,37 @@ pub async fn download_piece(stream: &mut TcpStream,peer_addr: &String, piece_len
                         }
                         request_blocks(stream, piece_length, piece_index, num_blocks, Arc::clone(&buf), pipeline_depth).await?;
                     },
-                    Ok(Ok(PeerMessage::Have(_i))) => { /* println!("Have piece - {}", i) */ },
-                    Ok(Ok(_)) => continue,
+                    Ok(Ok(PeerMessage::Have(i))) => { 
+                        timeout_count = 0; 
+                        let mut reg = registry.lock().await;
+                        reg.set_have(peer_addr, i);
+                    },
+                    Ok(Ok(_)) => { timeout_count = 0; continue; },
                     Ok(Err(e)) => return Err(e),
-                    Err(_) => return Err(Box::new(std::io::Error::new(std::io::ErrorKind::TimedOut, "Piece download timed out"))),
+                    Err(_) => {
+                        timeout_count += 1;
+                        if timeout_count >= 8 {
+                            return Err(Box::new(std::io::Error::new(std::io::ErrorKind::TimedOut, "Piece download timed out")));
+                        }
+                        // Timeout: assume lost requests, reset unreceived requested blocks, and re-request
+                        {
+                            let mut b = buf.lock().await;
+                            for i in 0..num_blocks as usize {
+                                if !b.recv_blocks[i] {
+                                    b.requested_blocks[i] = false;
+                                }
+                            }
+                        }
+                        request_blocks(stream, piece_length, piece_index, num_blocks, Arc::clone(&buf), pipeline_depth).await?;
+                    },
                 }
             }
         }
     }    
 }
 
-pub async fn wait_for_unchoke(stream: &mut TcpStream) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>>{
-    let unchoke  = timeout(Duration::from_secs(30), async {
+pub async fn wait_for_unchoke(stream: &mut TcpStream, peer_addr: &String, registry: &Arc<Mutex<PeerRegistry>>) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>>{
+    let unchoke  = timeout(Duration::from_secs(120), async {
     loop{
         match read_message(stream).await? {
             PeerMessage::Choke => { /* println!("got choke — continuing to wait"); */ continue;},
@@ -184,8 +207,14 @@ pub async fn wait_for_unchoke(stream: &mut TcpStream) -> Result<(), Box<dyn std:
                 tokio::task::yield_now().await;
                 continue;
             },
-            PeerMessage::Have(_i) => { /* println!("Have piece - {}", i) */ },
-            PeerMessage::Bitfield(_b) => { /* println!("bitfield: {} bytes", b.len()) */ },
+            PeerMessage::Have(i) => { 
+                let mut reg = registry.lock().await;
+                reg.set_have(peer_addr, i);
+            },
+            PeerMessage::Bitfield(b) => { 
+                let mut reg = registry.lock().await;
+                reg.set_bitfield(peer_addr, &b);
+            },
             _ =>{
                 tokio::task::yield_now().await;
                 continue;
@@ -247,7 +276,7 @@ pub async fn request_blocks(
 }
 
 pub async fn run_download(
-    peers: Vec<PeerAddress>,
+    peers_queue: Arc<Mutex<Vec<PeerAddress>>>,
     peer_id: [u8; 20],
     info_hash: [u8; 20],
     registry: Arc<Mutex<PeerRegistry>>,
@@ -263,10 +292,9 @@ pub async fn run_download(
     have_tx: tokio::sync::broadcast::Sender<u32>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
 
-    let peers_queue = Arc::new(Mutex::new(peers));
     let mut handles: Vec<tokio::task::JoinHandle<()>> = vec![];
 
-    let num_workers = 50; // Max concurrent connections
+    let num_workers = 250; // Max concurrent connections
 
     for _ in 0..num_workers {
         let queue_clone = Arc::clone(&peers_queue);
@@ -289,8 +317,12 @@ pub async fn run_download(
                 };
                 
                 let Some(peer) = peer_opt else {
-                    // Queue empty, worker exits
-                    break;
+                    // Queue empty, wait for more peers from tracker
+                    if dl_state_clone.lock().await.is_complete() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    continue;
                 };
 
                 let peer_addr = format!("{}:{}", peer.ip, peer.port);

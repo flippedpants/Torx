@@ -205,7 +205,7 @@ pub async fn peer_task(
             let _ = ui_tx.send(crate::ui::UiUpdate::ActivePeers(-1)).await;
             return;
         }
-        result = crate::download::wait_for_unchoke(&mut stream) => {
+        result = crate::download::wait_for_unchoke(&mut stream, &peer_addr, &registry) => {
             if result.is_err() {
                 crate::logger::log(&format!("[{}] - unchoke timeout", peer_addr));
                 let _ = ui_tx.send(crate::ui::UiUpdate::ActivePeers(-1)).await;
@@ -258,7 +258,7 @@ pub async fn peer_task(
             standard_piece_length
         };
 
-        match download_piece(&mut stream, &peer_addr, piece_length, piece_index, &token).await {
+        match download_piece(&mut stream, &peer_addr, piece_length, piece_index, &token, &registry).await {
             Ok(piece_buf) => {
                 if !verify_piece(&piece_buf.data, &piece_hashes[piece_index as usize]){
                     crate::logger::log(&format!("[{}] Piece mismatch, discarding piece {}", peer_addr, piece_index));

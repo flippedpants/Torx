@@ -7,6 +7,7 @@ mod piece;
 mod ui;
 mod logger;
 mod storage;
+mod upload;
 
 use std::{fs::{self}, sync::Arc};
 use parser::Torrent;
@@ -17,7 +18,7 @@ use crate::{download::{DownloadState,run_download}, peer::PeerRegistry};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-    let torrent_file = fs::read("/home/daksh/Downloads/big-buck-bunny.torrent").unwrap();
+    let torrent_file = fs::read("/home/daksh/Downloads/Resident Evil 4 (2023) [FitGirl Repack].torrent").unwrap();
 
     let file_content: Torrent = serde_bencode::from_bytes(&torrent_file).unwrap();
     
@@ -30,10 +31,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
     println!("Fetching peers from trackers...");
     let peers = collect_all_peers(&file_content, &torrent_file, &peer_id).await?;
 
+    let peers_queue = Arc::new(Mutex::new(peers));
+    let peers_queue_refill = Arc::clone(&peers_queue);
+
     let peer_id_bytes: [u8; 20] = peer_id.as_bytes().try_into().expect("Length Mismatch");
     let info_hash_bytes = info_hash.1;
 
-    println!("Found {} peers! Starting connection worker pool...", peers.len());
+    println!("Found {} peers! Starting connection worker pool...", peers_queue.lock().await.len());
 
     let mut piece_hashes: Vec<[u8; 20]> = vec![];
     for piece in pieces_split{
@@ -81,15 +85,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
 
     let (ui_tx, ui_rx) = tokio::sync::mpsc::channel(100);
 
+    let (have_tx, _) = tokio::sync::broadcast::channel::<u32>(512);
+    let upload_mgr = Arc::new(Mutex::new(upload::UploadManager::new()));
+
     let dl_state_clone = Arc::clone(&dl_state);
     let token = tokio_util::sync::CancellationToken::new();
     let token_ui = token.clone();
+    let token_upload = token.clone();
+    let token_choking = token.clone();
+    let token_tracker = token.clone();
 
     let storage_dl = Arc::clone(&storage);
     let ui_tx_dl = ui_tx.clone();
+    let upload_mgr_dl = Arc::clone(&upload_mgr);
+    let have_tx_dl = have_tx.clone();
     let download_handle = tokio::spawn(async move {
         if let Err(e) = run_download(
-            peers, 
+            peers_queue, 
             peer_id_bytes,
             info_hash_bytes,
             registry, 
@@ -100,9 +112,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
             arc_piece_hashes, 
             storage_dl, 
             ui_tx_dl,
-            token
+            token,
+            upload_mgr_dl,
+            have_tx_dl,
         ).await {
             crate::logger::log(&format!("run_download failed: {:?}", e));
+        }
+    });
+
+    let ui_tx_tracker = ui_tx.clone();
+    let file_content_tracker = file_content.clone();
+    let torrent_file_tracker = torrent_file.clone();
+    let peer_id_tracker = peer_id.clone();
+    let tracker_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(120));
+        interval.tick().await; // consume first tick
+        loop {
+            tokio::select! {
+                _ = token_tracker.cancelled() => break,
+                _ = interval.tick() => {
+                    let _ = ui_tx_tracker.send(ui::UiUpdate::Log("[SYSTEM] Fetching more peers from trackers...".to_string())).await;
+                    if let Ok(new_peers) = collect_all_peers(&file_content_tracker, &torrent_file_tracker, &peer_id_tracker).await {
+                        let mut q = peers_queue_refill.lock().await;
+                        // Avoid adding existing peers (basic dedup by ip/port)
+                        for p in new_peers {
+                            if !q.iter().any(|existing| existing.ip == p.ip && existing.port == p.port) {
+                                q.push(p);
+                            }
+                        }
+                        let _ = ui_tx_tracker.send(ui::UiUpdate::Log(format!("[SYSTEM] Tracker refill: Peer queue size is now {}", q.len()))).await;
+                    }
+                }
+            }
         }
     });
 
@@ -110,7 +151,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
         let _ = ui::run_ui(ui_state, single_file_name, total_length, ui_rx, token_ui).await;
     });
 
-    let _ = tokio::join!(download_handle, ui_handle);
+    let dl_state_upload = Arc::clone(&dl_state);
+    let storage_upload = Arc::clone(&storage);
+    let upload_mgr_upload = Arc::clone(&upload_mgr);
+    let have_tx_upload = have_tx.clone();
+    let ui_tx_upload = ui_tx.clone();
+
+    let upload_handle = tokio::spawn(async move {
+        if let Err(e) = upload::run_upload_listener(
+            6881,
+            info_hash_bytes,
+            peer_id_bytes,
+            dl_state_upload,
+            upload_mgr_upload,
+            storage_upload,
+            standard_piece_length,
+            have_tx_upload,
+            ui_tx_upload,
+            token_upload,
+        ).await {
+            crate::logger::log(&format!("Upload listener error: {:?}", e));
+        }
+    });
+
+    let upload_mgr_choking = Arc::clone(&upload_mgr);
+    let choking_handle = tokio::spawn(async move {
+        upload::run_choking_algorithm(upload_mgr_choking, token_choking).await;
+    });
+
+    let _ = tokio::join!(download_handle, ui_handle, upload_handle, choking_handle, tracker_handle);
 
     Ok(())
 }

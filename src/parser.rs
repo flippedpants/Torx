@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Torrent{
     pub announce: String,
 
@@ -18,7 +18,7 @@ pub struct Torrent{
     pub info: Info,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Info {
     pub name: String,
 
@@ -33,7 +33,7 @@ pub struct Info {
     pub mode: FileMode
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum FileMode {
     SingleFileMode {
@@ -45,7 +45,7 @@ pub enum FileMode {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct File{
     pub length: u64,
     pub path: Vec<String>
