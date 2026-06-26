@@ -114,7 +114,7 @@ pub async fn bit_torrent_handshake(peer: &PeerAddress, peer_id: [u8; 20],info_ha
     }
 }
 
-pub async fn download_piece(stream: &mut TcpStream,peer_addr: &String, piece_length: u64, piece_index: u32, token: &CancellationToken, registry: &Arc<Mutex<PeerRegistry>>)-> Result<PieceBuf, Box<dyn std::error::Error + Send + Sync + 'static>> {
+pub async fn download_piece(stream: &mut TcpStream,peer_addr: &String, piece_length: u64, piece_index: u32, token: &CancellationToken, registry: &Arc<Mutex<PeerRegistry>>, ui_tx: &tokio::sync::mpsc::Sender<crate::ui::UiUpdate>, dl_state: &Arc<Mutex<DownloadState>>)-> Result<PieceBuf, Box<dyn std::error::Error + Send + Sync + 'static>> {
 
     let num_blocks = (piece_length + BLOCK_SIZE -1 )/ BLOCK_SIZE;
     let buf = Arc::new(Mutex::new(PieceBuf::new(piece_length)));
@@ -124,6 +124,8 @@ pub async fn download_piece(stream: &mut TcpStream,peer_addr: &String, piece_len
     request_blocks(stream, piece_length, piece_index, num_blocks, Arc::clone(&buf), pipeline_depth).await?;
 
     let mut timeout_count = 0;
+    let mut last_ui_update = std::time::Instant::now();
+    let mut downloaded_delta = 0u64;
 
     loop {
         if token.is_cancelled() {
@@ -138,14 +140,49 @@ pub async fn download_piece(stream: &mut TcpStream,peer_addr: &String, piece_len
                         timeout_count = 0;
                         if index != piece_index {continue;}
                         
-                        let mut b = buf.lock().await;
-                        b.add_block(begin, &data);
+                        let is_new = {
+                            let mut b = buf.lock().await;
+                            let prev_recv = b.recv;
+                            b.add_block(begin, &data);
+                            b.recv > prev_recv
+                        };
 
-                        if b.is_complete() {
-                            drop(b);
+                        if is_new {
+                            downloaded_delta += data.len() as u64;
+                        }
+
+                        if last_ui_update.elapsed() > std::time::Duration::from_millis(200) {
+                            if downloaded_delta > 0 {
+                                let mut state = dl_state.lock().await;
+                                state.downloaded_bytes += downloaded_delta;
+                                let _ = ui_tx.send(crate::ui::UiUpdate::DownloadedBytes(state.downloaded_bytes)).await;
+                                
+                                let _ = ui_tx.send(crate::ui::UiUpdate::PeerStats {
+                                    ip: peer_addr.clone(),
+                                    downloaded_delta,
+                                    uploaded_delta: 0,
+                                    progress: 0.0,
+                                }).await;
+                                downloaded_delta = 0;
+                            }
+                            last_ui_update = std::time::Instant::now();
+                        }
+
+                        let is_complete = { buf.lock().await.is_complete() };
+                        if is_complete {
+                            if downloaded_delta > 0 {
+                                let mut state = dl_state.lock().await;
+                                state.downloaded_bytes += downloaded_delta;
+                                let _ = ui_tx.send(crate::ui::UiUpdate::DownloadedBytes(state.downloaded_bytes)).await;
+                                let _ = ui_tx.send(crate::ui::UiUpdate::PeerStats {
+                                    ip: peer_addr.clone(),
+                                    downloaded_delta,
+                                    uploaded_delta: 0,
+                                    progress: 0.0,
+                                }).await;
+                            }
                             return Ok(Arc::try_unwrap(buf).unwrap().into_inner());
                         }
-                        drop(b);
 
                         // Refill the pipeline immediately as soon as we get a block
                         request_blocks(stream, piece_length, piece_index, num_blocks, Arc::clone(&buf), pipeline_depth).await?;

@@ -258,7 +258,7 @@ pub async fn peer_task(
             standard_piece_length
         };
 
-        match download_piece(&mut stream, &peer_addr, piece_length, piece_index, &token, &registry).await {
+        match download_piece(&mut stream, &peer_addr, piece_length, piece_index, &token, &registry, &ui_tx, &dl_state).await {
             Ok(piece_buf) => {
                 if !verify_piece(&piece_buf.data, &piece_hashes[piece_index as usize]){
                     crate::logger::log(&format!("[{}] Piece mismatch, discarding piece {}", peer_addr, piece_index));
@@ -283,24 +283,23 @@ pub async fn peer_task(
                 {
                     let mut state = dl_state.lock().await;
                     state.mark_done(piece_index);
-                    state.downloaded_bytes += piece_length as u64;
                     let _ = have_tx.send(piece_index);
 
-                    let _ = ui_tx.send(crate::ui::UiUpdate::DownloadedBytes(state.downloaded_bytes)).await;
                     let _ = ui_tx.send(crate::ui::UiUpdate::PieceStatus(piece_index, crate::ui::PieceStatus::Complete)).await;
                     let _ = ui_tx.send(crate::ui::UiUpdate::Log(format!("[INFO] Verified and saved piece {} from {}", piece_index, peer_addr))).await;
                     
                     let progress = (state.num_pieces - state.needed.iter().filter(|&&n| n).count() as u32) as f64 / state.num_pieces as f64;
                     let _ = ui_tx.send(crate::ui::UiUpdate::PeerStats {
                         ip: peer_addr.clone(),
-                        downloaded_delta: piece_length as u64,
+                        downloaded_delta: 0,
                         uploaded_delta: 0,
                         progress,
                     }).await;
 
+                    // Upload mode check: if completed all pieces, we break
                     if state.is_complete() {
-                        let _ = ui_tx.send(crate::ui::UiUpdate::Log("[SYSTEM] Download complete! Entering seed mode.".to_string())).await;
-                        drop(state);
+                        crate::logger::log(&format!("[{}] Download complete, switching to serve mode", peer_addr));
+                        let _ = ui_tx.send(crate::ui::UiUpdate::Log(format!("[SYSTEM] Torx download complete, switching {} to serve mode", peer_addr))).await;
                         break;
                     }
                 }

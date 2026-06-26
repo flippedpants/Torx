@@ -18,7 +18,7 @@ use crate::{download::{DownloadState,run_download}, peer::PeerRegistry};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-    let torrent_file = fs::read("/home/daksh/Downloads/Resident Evil 4 (2023) [FitGirl Repack].torrent").unwrap();
+    let torrent_file = fs::read("/home/daksh/Downloads/big-buck-bunny.torrent").unwrap();
 
     let file_content: Torrent = serde_bencode::from_bytes(&torrent_file).unwrap();
     
@@ -83,7 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
         storage.preallocate().await.unwrap();
     }
 
-    let (ui_tx, ui_rx) = tokio::sync::mpsc::channel(100);
+    let (ui_tx, ui_rx) = tokio::sync::mpsc::channel(10000);
 
     let (have_tx, _) = tokio::sync::broadcast::channel::<u32>(512);
     let upload_mgr = Arc::new(Mutex::new(upload::UploadManager::new()));

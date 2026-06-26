@@ -264,7 +264,8 @@ pub async fn collect_all_peers(
         }
     }
     
-    urls.push("udp://tracker.publictracker.xyz:6969/announce".to_string());
+    //fallback tracker
+    urls.push("udp://zer0day.ch:1337/announce".to_string());
     
     let mut unique_urls = HashSet::new();
     let mut final_urls = Vec::new();
