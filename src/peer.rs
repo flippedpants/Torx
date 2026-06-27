@@ -3,7 +3,7 @@ use std::{collections::{HashMap, HashSet}, sync::Arc};
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpStream, sync::Mutex};
 use tokio_util::sync::CancellationToken;
 
-use crate::{download::{DownloadState, download_piece}, piece::verify_piece};
+use crate::{download::DownloadState, piece::verify_piece};
 
 #[derive(Debug)]
 pub enum PeerMessage{
@@ -112,7 +112,7 @@ impl PeerRegistry{
     }
 }
 
-pub async fn read_message(stream: &mut TcpStream) -> Result<PeerMessage, Box<dyn std::error::Error + Send + Sync + 'static>>{
+pub async fn read_message<R: tokio::io::AsyncRead + Unpin>(stream: &mut R) -> Result<PeerMessage, Box<dyn std::error::Error + Send + Sync + 'static>>{
     let mut buf_length = [0u8; 4];
     stream.read_exact(&mut buf_length).await?;
     let message_length = u32::from_be_bytes(buf_length);
@@ -200,12 +200,53 @@ pub async fn peer_task(
         return;
     }
 
+    let mut have_rx = have_tx.subscribe();
+    let mut choke_rx = {
+        let mut mgr = upload_mgr.lock().await;
+        mgr.register_peer(peer_addr.clone())
+    };
+
+    let (mut reader, mut writer) = stream.into_split();
+    let (msg_tx, mut msg_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1024);
+    
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        while let Some(msg) = msg_rx.recv().await {
+            if writer.write_all(&msg).await.is_err() { break; }
+        }
+    });
+
+    let tx1 = msg_tx.clone();
+    tokio::spawn(async move {
+        while let Ok(piece_idx) = have_rx.recv().await {
+            let mut msg = Vec::with_capacity(9);
+            msg.extend_from_slice(&5u32.to_be_bytes());
+            msg.push(4);
+            msg.extend_from_slice(&piece_idx.to_be_bytes());
+            if tx1.send(msg).await.is_err() { break; }
+        }
+    });
+
+    let tx2 = msg_tx.clone();
+    let peer_addr_clone = peer_addr.clone();
+    tokio::spawn(async move {
+        while choke_rx.changed().await.is_ok() {
+            let choked = *choke_rx.borrow();
+            let msg_id: u8 = if choked { 0 } else { 1 };
+            if tx2.send(vec![0, 0, 0, 1, msg_id]).await.is_err() { break; }
+            crate::logger::log(&format!("[{}] Sent {} via background task", peer_addr_clone, if choked { "choke" } else { "unchoke" }));
+        }
+    });
+
     tokio::select! {
         _ = token.cancelled() => {
             let _ = ui_tx.send(crate::ui::UiUpdate::ActivePeers(-1)).await;
             return;
         }
-        result = crate::download::wait_for_unchoke(&mut stream, &peer_addr, &registry) => {
+        result = crate::download::wait_for_unchoke(
+            &mut reader, &msg_tx, &peer_addr, &registry, &ui_tx, &dl_state,
+            &upload_mgr, &storage, standard_piece_length
+        ) => {
             if result.is_err() {
                 crate::logger::log(&format!("[{}] - unchoke timeout", peer_addr));
                 let _ = ui_tx.send(crate::ui::UiUpdate::ActivePeers(-1)).await;
@@ -258,7 +299,11 @@ pub async fn peer_task(
             standard_piece_length
         };
 
-        match download_piece(&mut stream, &peer_addr, piece_length, piece_index, &token, &registry, &ui_tx, &dl_state).await {
+        match crate::download::download_piece(
+            &mut reader, &msg_tx, &peer_addr, piece_length, piece_index, &token, 
+            &registry, &ui_tx, &dl_state, &upload_mgr, &storage, 
+            standard_piece_length
+        ).await {
             Ok(piece_buf) => {
                 if !verify_piece(&piece_buf.data, &piece_hashes[piece_index as usize]){
                     crate::logger::log(&format!("[{}] Piece mismatch, discarding piece {}", peer_addr, piece_index));
@@ -340,13 +385,13 @@ pub async fn peer_task(
     // Transition to serve mode — keep the connection alive and serve pieces
     crate::logger::log(&format!("[{}] transitioning to serve mode", peer_addr));
     crate::upload::serve_peer(
-        &mut stream,
+        &mut reader,
+        &msg_tx,
         &peer_addr,
         &dl_state,
         &upload_mgr,
         &storage,
         standard_piece_length,
-        &have_tx,
         &ui_tx,
         &token,
     ).await;

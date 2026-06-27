@@ -114,28 +114,36 @@ pub async fn bit_torrent_handshake(peer: &PeerAddress, peer_id: [u8; 20],info_ha
     }
 }
 
-pub async fn download_piece(stream: &mut TcpStream,peer_addr: &String, piece_length: u64, piece_index: u32, token: &CancellationToken, registry: &Arc<Mutex<PeerRegistry>>, ui_tx: &tokio::sync::mpsc::Sender<crate::ui::UiUpdate>, dl_state: &Arc<Mutex<DownloadState>>)-> Result<PieceBuf, Box<dyn std::error::Error + Send + Sync + 'static>> {
-
-    let num_blocks = (piece_length + BLOCK_SIZE -1 )/ BLOCK_SIZE;
+pub async fn download_piece(
+    reader: &mut tokio::net::tcp::OwnedReadHalf,
+    msg_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
+    peer_addr: &String,
+    piece_length: u64,
+    piece_index: u32,
+    token: &CancellationToken,
+    registry: &Arc<Mutex<PeerRegistry>>,
+    ui_tx: &tokio::sync::mpsc::Sender<crate::ui::UiUpdate>,
+    dl_state: &Arc<Mutex<DownloadState>>,
+    upload_mgr: &Arc<Mutex<crate::upload::UploadManager>>,
+    storage: &Arc<crate::storage::FileEntry>,
+    standard_piece_length: u64,
+)-> Result<PieceBuf, Box<dyn std::error::Error + Send + Sync + 'static>> {
+    let num_blocks = (piece_length + BLOCK_SIZE - 1) / BLOCK_SIZE;
     let buf = Arc::new(Mutex::new(PieceBuf::new(piece_length)));
     let pipeline_depth = 250;
 
     // Initial fill of the pipeline
-    request_blocks(stream, piece_length, piece_index, num_blocks, Arc::clone(&buf), pipeline_depth).await?;
+    request_blocks(msg_tx, piece_length, piece_index, num_blocks, Arc::clone(&buf), pipeline_depth).await?;
 
     let mut timeout_count = 0;
     let mut last_ui_update = std::time::Instant::now();
     let mut downloaded_delta = 0u64;
 
     loop {
-        if token.is_cancelled() {
-            return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "cancelled")));
-        }
-
-        tokio::select! {
-            _ = token.cancelled() => return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "Cancelled"))),
-            msg = tokio::time::timeout(Duration::from_secs(5), read_message(stream)) => {
-                match msg {
+        if token.is_cancelled() { return Err("Cancelled".into()); }
+        
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), read_message(reader)).await;
+        match msg {
                     Ok(Ok(PeerMessage::Piece {index, begin, data})) => {
                         timeout_count = 0;
                         if index != piece_index {continue;}
@@ -149,6 +157,10 @@ pub async fn download_piece(stream: &mut TcpStream,peer_addr: &String, piece_len
 
                         if is_new {
                             downloaded_delta += data.len() as u64;
+                            {
+                                let mut mgr = upload_mgr.lock().await;
+                                mgr.record_download_from(peer_addr, data.len() as u64);
+                            }
                         }
 
                         if last_ui_update.elapsed() > std::time::Duration::from_millis(200) {
@@ -185,13 +197,13 @@ pub async fn download_piece(stream: &mut TcpStream,peer_addr: &String, piece_len
                         }
 
                         // Refill the pipeline immediately as soon as we get a block
-                        request_blocks(stream, piece_length, piece_index, num_blocks, Arc::clone(&buf), pipeline_depth).await?;
+                        request_blocks(msg_tx, piece_length, piece_index, num_blocks, Arc::clone(&buf), pipeline_depth).await?;
                     },
 
                     Ok(Ok(PeerMessage::Choke)) => {
                         timeout_count = 0;
                         crate::logger::log(&format!("[{}] choked mid-piece {}", peer_addr, piece_index));
-                        wait_for_unchoke(stream, peer_addr, registry).await?;
+                        wait_for_unchoke(reader, msg_tx, peer_addr, registry, ui_tx, dl_state, upload_mgr, storage, standard_piece_length).await?;
                         
                         // After unchoke, reset requested status for non-received blocks and refill
                         {
@@ -202,7 +214,61 @@ pub async fn download_piece(stream: &mut TcpStream,peer_addr: &String, piece_len
                                 }
                             }
                         }
-                        request_blocks(stream, piece_length, piece_index, num_blocks, Arc::clone(&buf), pipeline_depth).await?;
+                        request_blocks(msg_tx, piece_length, piece_index, num_blocks, Arc::clone(&buf), pipeline_depth).await?;
+                    },
+                    Ok(Ok(PeerMessage::Interested)) => {
+                        crate::logger::log(&format!("[{}] Peer is interested during download", peer_addr));
+                        let mut mgr = upload_mgr.lock().await;
+                        mgr.set_interested(peer_addr, true);
+                    },
+                    Ok(Ok(PeerMessage::NotInterested)) => {
+                        let mut mgr = upload_mgr.lock().await;
+                        mgr.set_interested(peer_addr, false);
+                    },
+                    Ok(Ok(PeerMessage::Request { index, begin, length })) => {
+                        let is_choked = {
+                            let mgr = upload_mgr.lock().await;
+                            mgr.is_peer_choked(peer_addr)
+                        };
+                        if is_choked { continue; }
+
+                        let storage_clone = Arc::clone(storage);
+                        let tx = msg_tx.clone();
+                        let peer_addr_clone = peer_addr.clone();
+                        let ui_tx_clone = ui_tx.clone();
+                        let dl_state_clone = Arc::clone(dl_state);
+                        let upload_mgr_clone = Arc::clone(upload_mgr);
+
+                        tokio::spawn(async move {
+                            if let Ok(data) = storage_clone.read_block(index, standard_piece_length, begin, length as u64).await {
+                                let msg_len = (9 + data.len()) as u32;
+                                let mut piece_msg = Vec::with_capacity(4 + 9 + data.len());
+                                piece_msg.extend_from_slice(&msg_len.to_be_bytes());
+                                piece_msg.push(7);
+                                piece_msg.extend_from_slice(&index.to_be_bytes());
+                                piece_msg.extend_from_slice(&(begin as u32).to_be_bytes());
+                                piece_msg.extend_from_slice(&data);
+
+                                if tx.send(piece_msg).await.is_ok() {
+                                    let bytes_sent = data.len() as u64;
+                                    {
+                                        let mut mgr = upload_mgr_clone.lock().await;
+                                        mgr.record_upload_to(&peer_addr_clone, bytes_sent);
+                                    }
+                                    {
+                                        let mut state = dl_state_clone.lock().await;
+                                        state.uploaded_bytes += bytes_sent;
+                                        let _ = ui_tx_clone.send(crate::ui::UiUpdate::UploadedBytes(state.uploaded_bytes)).await;
+                                    }
+                                    let _ = ui_tx_clone.send(crate::ui::UiUpdate::PeerStats {
+                                        ip: peer_addr_clone,
+                                        downloaded_delta: 0,
+                                        uploaded_delta: bytes_sent,
+                                        progress: 0.0,
+                                    }).await;
+                                }
+                            }
+                        });
                     },
                     Ok(Ok(PeerMessage::Have(i))) => { 
                         timeout_count = 0; 
@@ -225,43 +291,98 @@ pub async fn download_piece(stream: &mut TcpStream,peer_addr: &String, piece_len
                                 }
                             }
                         }
-                        request_blocks(stream, piece_length, piece_index, num_blocks, Arc::clone(&buf), pipeline_depth).await?;
-                    },
-                }
-            }
+                        request_blocks(msg_tx, piece_length, piece_index, num_blocks, Arc::clone(&buf), pipeline_depth).await?;
+                    }
         }
     }    
 }
 
-pub async fn wait_for_unchoke(stream: &mut TcpStream, peer_addr: &String, registry: &Arc<Mutex<PeerRegistry>>) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>>{
-    let unchoke  = timeout(Duration::from_secs(120), async {
+pub async fn wait_for_unchoke(
+    reader: &mut tokio::net::tcp::OwnedReadHalf,
+    msg_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
+    peer_addr: &String, 
+    registry: &Arc<Mutex<PeerRegistry>>,
+    ui_tx: &tokio::sync::mpsc::Sender<crate::ui::UiUpdate>,
+    dl_state: &Arc<Mutex<DownloadState>>,
+    upload_mgr: &Arc<Mutex<crate::upload::UploadManager>>,
+    storage: &Arc<crate::storage::FileEntry>,
+    standard_piece_length: u64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>>{
+    let unchoke  = timeout(std::time::Duration::from_secs(120), async {
     loop{
-        match read_message(stream).await? {
-            PeerMessage::Choke => { /* println!("got choke — continuing to wait"); */ continue;},
-            PeerMessage::Unchoke => return Ok(()),
-            PeerMessage::KeepAlive => {
-                // println!("Keep alive");
-                tokio::task::yield_now().await;
-                continue;
-            },
-            PeerMessage::Have(i) => { 
-                let mut reg = registry.lock().await;
-                reg.set_have(peer_addr, i);
-            },
-            PeerMessage::Bitfield(b) => { 
-                let mut reg = registry.lock().await;
-                reg.set_bitfield(peer_addr, &b);
-            },
-            _ =>{
-                tokio::task::yield_now().await;
-                continue;
-            },
-        };
-    }
+        let msg = read_message(reader).await;
+        match msg? {
+                    PeerMessage::Choke => { continue; },
+                    PeerMessage::Unchoke => return Ok::<(), Box<dyn std::error::Error + Send + Sync + 'static>>(()),
+                    PeerMessage::KeepAlive => { tokio::task::yield_now().await; continue; },
+                    PeerMessage::Have(i) => { 
+                        let mut reg = registry.lock().await;
+                        reg.set_have(peer_addr, i);
+                    },
+                    PeerMessage::Bitfield(b) => { 
+                        let mut reg = registry.lock().await;
+                        reg.set_bitfield(peer_addr, &b);
+                    },
+                    PeerMessage::Interested => {
+                        crate::logger::log(&format!("[{}] Peer is interested while waiting unchoke", peer_addr));
+                        let mut mgr = upload_mgr.lock().await;
+                        mgr.set_interested(peer_addr, true);
+                    },
+                    PeerMessage::NotInterested => {
+                        let mut mgr = upload_mgr.lock().await;
+                        mgr.set_interested(peer_addr, false);
+                    },
+                    PeerMessage::Request { index, begin, length } => {
+                        let is_choked = {
+                            let mgr = upload_mgr.lock().await;
+                            mgr.is_peer_choked(peer_addr)
+                        };
+                        if is_choked { continue; }
 
-    #[allow(unreachable_code)]
-    Ok::<(), Box<dyn std::error::Error + Send + Sync + 'static>>(() )
+                        let storage_clone = Arc::clone(storage);
+                        let tx = msg_tx.clone();
+                        let peer_addr_clone = peer_addr.clone();
+                        let ui_tx_clone = ui_tx.clone();
+                        let dl_state_clone = Arc::clone(dl_state);
+                        let upload_mgr_clone = Arc::clone(upload_mgr);
 
+                        tokio::spawn(async move {
+                            if let Ok(data) = storage_clone.read_block(index, standard_piece_length, begin, length as u64).await {
+                                let msg_len = (9 + data.len()) as u32;
+                                let mut piece_msg = Vec::with_capacity(4 + 9 + data.len());
+                                piece_msg.extend_from_slice(&msg_len.to_be_bytes());
+                                piece_msg.push(7);
+                                piece_msg.extend_from_slice(&index.to_be_bytes());
+                                piece_msg.extend_from_slice(&(begin as u32).to_be_bytes());
+                                piece_msg.extend_from_slice(&data);
+
+                                if tx.send(piece_msg).await.is_ok() {
+                                    let bytes_sent = data.len() as u64;
+                                    {
+                                        let mut mgr = upload_mgr_clone.lock().await;
+                                        mgr.record_upload_to(&peer_addr_clone, bytes_sent);
+                                    }
+                                    {
+                                        let mut state = dl_state_clone.lock().await;
+                                        state.uploaded_bytes += bytes_sent;
+                                        let _ = ui_tx_clone.send(crate::ui::UiUpdate::UploadedBytes(state.uploaded_bytes)).await;
+                                    }
+                                    let _ = ui_tx_clone.send(crate::ui::UiUpdate::PeerStats {
+                                        ip: peer_addr_clone,
+                                        downloaded_delta: 0,
+                                        uploaded_delta: bytes_sent,
+                                        progress: 0.0,
+                                    }).await;
+                                }
+                            }
+                        });
+                    },
+                    _ =>{
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                }
+            }
     }).await;
 
     match unchoke{
@@ -271,7 +392,7 @@ pub async fn wait_for_unchoke(stream: &mut TcpStream, peer_addr: &String, regist
 }
 
 pub async fn request_blocks(
-    stream: &mut TcpStream, 
+    msg_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
     piece_length: u64, 
     piece_index: u32,
     num_blocks: u64, 
@@ -303,7 +424,7 @@ pub async fn request_blocks(
         req.extend_from_slice(&(begin as u32).to_be_bytes());
         req.extend_from_slice(&(length as u32).to_be_bytes());
         
-        stream.write_all(&req).await?;
+        let _ = msg_tx.send(req).await;
         
         b.requested_blocks[i as usize] = true;
         to_request -= 1;
@@ -355,9 +476,6 @@ pub async fn run_download(
                 
                 let Some(peer) = peer_opt else {
                     // Queue empty, wait for more peers from tracker
-                    if dl_state_clone.lock().await.is_complete() {
-                        break;
-                    }
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     continue;
                 };

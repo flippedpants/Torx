@@ -189,21 +189,16 @@ async fn read_msg<R: tokio::io::AsyncRead + Unpin>(
 /// Called by both `handle_incoming_peer` (for inbound connections) and
 /// `peer_task` (for outbound connections transitioning to seed mode).
 pub async fn serve_peer(
-    stream: &mut tokio::net::TcpStream,
+    reader: &mut tokio::net::tcp::OwnedReadHalf,
+    msg_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
     peer_addr: &str,
     dl_state: &Arc<Mutex<DownloadState>>,
     upload_mgr: &Arc<Mutex<UploadManager>>,
     storage: &Arc<FileEntry>,
     standard_piece_length: u64,
-    have_tx: &broadcast::Sender<u32>,
     ui_tx: &tokio::sync::mpsc::Sender<UiUpdate>,
     token: &CancellationToken,
 ) {
-    // Register with the choking engine
-    let mut choke_rx = {
-        let mut mgr = upload_mgr.lock().await;
-        mgr.register_peer(peer_addr.to_string())
-    };
 
     // Announce all pieces we currently have (batch write for efficiency)
     {
@@ -217,7 +212,7 @@ pub async fn serve_peer(
             }
         }
         if !batch.is_empty() {
-            if stream.write_all(&batch).await.is_err() {
+            if msg_tx.send(batch).await.is_err() {
                 let mut mgr = upload_mgr.lock().await;
                 mgr.remove_peer(peer_addr);
                 return;
@@ -225,10 +220,7 @@ pub async fn serve_peer(
         }
     }
 
-    let mut have_rx = have_tx.subscribe();
-
-    // Split stream so we can read and write concurrently in select!
-    let (mut reader, mut writer) = stream.split();
+    // No need to split stream, we already have reader and msg_tx
     let mut keepalive_interval = tokio::time::interval(std::time::Duration::from_secs(120));
     keepalive_interval.tick().await; // consume initial immediate tick
 
@@ -237,38 +229,10 @@ pub async fn serve_peer(
             _ = token.cancelled() => break,
 
             _ = keepalive_interval.tick() => {
-                if writer.write_all(&[0, 0, 0, 0]).await.is_err() { break; }
+                if msg_tx.send(vec![0, 0, 0, 0]).await.is_err() { break; }
             }
 
-            result = choke_rx.changed() => {
-                if result.is_err() { break; }
-                let choked = *choke_rx.borrow();
-                let msg_id: u8 = if choked { 0 } else { 1 }; // 0=Choke, 1=Unchoke
-                if writer.write_all(&[0, 0, 0, 1, msg_id]).await.is_err() { break; }
-                crate::logger::log(&format!(
-                    "[SERVE:{}] Sent {}", peer_addr, if choked { "choke" } else { "unchoke" }
-                ));
-            }
-
-            result = have_rx.recv() => {
-                match result {
-                    Ok(piece_index) => {
-                        let mut msg = Vec::with_capacity(9);
-                        msg.extend_from_slice(&5u32.to_be_bytes());
-                        msg.push(4);
-                        msg.extend_from_slice(&piece_index.to_be_bytes());
-                        if writer.write_all(&msg).await.is_err() { break; }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        crate::logger::log(&format!(
-                            "[SERVE:{}] Lagged {} have messages", peer_addr, n
-                        ));
-                    }
-                    Err(_) => break,
-                }
-            }
-
-            msg = read_msg(&mut reader) => {
+            msg = crate::peer::read_message(reader) => {
                 match msg {
                     Ok(PeerMessage::Interested) => {
                         let mut mgr = upload_mgr.lock().await;
@@ -298,46 +262,43 @@ pub async fn serve_peer(
                         // Reject oversized block requests (anti-abuse)
                         if length > BLOCK_SIZE as u32 * 2 { continue; }
 
-                        // Read block from disk and send Piece response
-                        match storage.read_block(
-                            index, standard_piece_length, begin, length as u64
-                        ).await {
-                            Ok(data) => {
+                        let tx = msg_tx.clone();
+                        let storage_clone = Arc::clone(storage);
+                        let peer_addr_clone = peer_addr.to_string();
+                        let upload_mgr_clone = Arc::clone(upload_mgr);
+                        let ui_tx_clone = ui_tx.clone();
+                        let dl_state_clone = Arc::clone(dl_state);
+
+                        tokio::spawn(async move {
+                            if let Ok(data) = storage_clone.read_block(index, standard_piece_length, begin, length as u64).await {
                                 let msg_len = (9 + data.len()) as u32;
                                 let mut piece_msg = Vec::with_capacity(4 + 9 + data.len());
                                 piece_msg.extend_from_slice(&msg_len.to_be_bytes());
-                                piece_msg.push(7); // Piece message ID
+                                piece_msg.push(7); // Piece ID
                                 piece_msg.extend_from_slice(&index.to_be_bytes());
                                 piece_msg.extend_from_slice(&(begin as u32).to_be_bytes());
                                 piece_msg.extend_from_slice(&data);
 
-                                if writer.write_all(&piece_msg).await.is_err() { break; }
-
-                                let bytes_sent = data.len() as u64;
-                                {
-                                    let mut mgr = upload_mgr.lock().await;
-                                    mgr.record_upload_to(peer_addr, bytes_sent);
+                                if tx.send(piece_msg).await.is_ok() {
+                                    let bytes_sent = data.len() as u64;
+                                    {
+                                        let mut mgr = upload_mgr_clone.lock().await;
+                                        mgr.record_upload_to(&peer_addr_clone, bytes_sent);
+                                    }
+                                    {
+                                        let mut state = dl_state_clone.lock().await;
+                                        state.uploaded_bytes += bytes_sent;
+                                        let _ = ui_tx_clone.send(UiUpdate::UploadedBytes(state.uploaded_bytes)).await;
+                                    }
+                                    let _ = ui_tx_clone.send(UiUpdate::PeerStats {
+                                        ip: peer_addr_clone,
+                                        downloaded_delta: 0,
+                                        uploaded_delta: bytes_sent,
+                                        progress: 0.0,
+                                    }).await;
                                 }
-                                {
-                                    let mut state = dl_state.lock().await;
-                                    state.uploaded_bytes += bytes_sent;
-                                    let _ = ui_tx.send(
-                                        UiUpdate::UploadedBytes(state.uploaded_bytes)
-                                    ).await;
-                                }
-                                let _ = ui_tx.send(UiUpdate::PeerStats {
-                                    ip: peer_addr.to_string(),
-                                    downloaded_delta: 0,
-                                    uploaded_delta: bytes_sent,
-                                    progress: 0.0,
-                                }).await;
                             }
-                            Err(e) => {
-                                crate::logger::log(&format!(
-                                    "[SERVE:{}] Read block error: {}", peer_addr, e
-                                ));
-                            }
-                        }
+                        });
                     }
                     Ok(PeerMessage::Cancel) => {
                         // Requests are served immediately so there's nothing to cancel
@@ -520,12 +481,52 @@ async fn handle_incoming_peer(
         "[UPLOAD] Incoming peer {} connected", peer_addr
     ))).await;
 
+    let mut have_rx = have_tx.subscribe();
+    let mut choke_rx = {
+        let mut mgr = upload_mgr.lock().await;
+        mgr.register_peer(peer_addr.clone())
+    };
+
+    let (mut reader, mut writer) = stream.into_split();
+    let (msg_tx, mut msg_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1024);
+    
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        while let Some(msg) = msg_rx.recv().await {
+            if writer.write_all(&msg).await.is_err() { break; }
+        }
+    });
+
+    let tx1 = msg_tx.clone();
+    tokio::spawn(async move {
+        while let Ok(piece_idx) = have_rx.recv().await {
+            let mut msg = Vec::with_capacity(9);
+            msg.extend_from_slice(&5u32.to_be_bytes());
+            msg.push(4); // Have message ID
+            msg.extend_from_slice(&piece_idx.to_be_bytes());
+            if tx1.send(msg).await.is_err() { break; }
+        }
+    });
+
+    let tx2 = msg_tx.clone();
+    let peer_addr_clone = peer_addr.clone();
+    tokio::spawn(async move {
+        while choke_rx.changed().await.is_ok() {
+            let choked = *choke_rx.borrow();
+            let msg_id: u8 = if choked { 0 } else { 1 }; // 0=Choke, 1=Unchoke
+            if tx2.send(vec![0, 0, 0, 1, msg_id]).await.is_err() { break; }
+            crate::logger::log(&format!(
+                "[SERVE:{}] Sent {} via background task", peer_addr_clone, if choked { "choke" } else { "unchoke" }
+            ));
+        }
+    });
+
     // 5. Enter the shared serve loop
     serve_peer(
-        &mut stream, &peer_addr,
+        &mut reader, &msg_tx, &peer_addr,
         &dl_state, &upload_mgr, &storage,
         standard_piece_length,
-        &have_tx, &ui_tx, &token,
+        &ui_tx, &token,
     ).await;
 
     let _ = ui_tx.send(UiUpdate::ActivePeers(-1)).await;

@@ -9,7 +9,7 @@ mod logger;
 mod storage;
 mod upload;
 
-use std::{fs::{self}, sync::Arc};
+use std::{fs::{self}, io, sync::Arc};
 use parser::Torrent;
 use build_request::{calculate_info_hash, split_pieces, calculate_torrent_size, generate_id, collect_all_peers};
 use tokio::{sync::Mutex};
@@ -18,7 +18,11 @@ use crate::{download::{DownloadState,run_download}, peer::PeerRegistry};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-    let torrent_file = fs::read("/home/daksh/Downloads/big-buck-bunny.torrent").unwrap();
+    let mut torrent_path = String::new();
+    println!("Enter the path of the torrent: ");
+    io::stdin().read_line(&mut torrent_path).expect("Failed to read path");
+
+    let torrent_file = fs::read(torrent_path.trim()).unwrap();
 
     let file_content: Torrent = serde_bencode::from_bytes(&torrent_file).unwrap();
     
