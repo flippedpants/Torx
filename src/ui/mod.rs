@@ -18,6 +18,8 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum AppTab {
+    Setup,
+    Trackers,
     Overview,
     Peers,
     Files,
@@ -55,6 +57,13 @@ pub enum UiUpdate {
         progress: f64,
     },
     Log(String),
+    Init {
+        torrent_name: String,
+        total_length: u64,
+        num_pieces: u32,
+        file_names: Vec<String>,
+    },
+    TrackersQueried(Vec<String>),
 }
 
 /// Snapshot of download state for the UI to read without holding a tokio lock.
@@ -70,19 +79,21 @@ pub struct UiState {
     pub logs: Vec<String>,
     pub peers: Vec<PeerInfo>,
     pub file_names: Vec<String>,
+    pub trackers: Vec<String>,
+    pub torrent_name: String,
+    pub total_length: u64,
 }
 
 pub async fn run_ui(
     ui_state: Arc<StdMutex<UiState>>,
-    torrent_name: String,
-    total_length: u64,
     rx: mpsc::Receiver<UiUpdate>,
+    setup_tx: tokio::sync::oneshot::Sender<(String, String)>,
     token: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let token_clone = token.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        run_ui_blocking(ui_state, torrent_name, total_length, rx, token_clone)
+        run_ui_blocking(ui_state, rx, setup_tx, token_clone)
     }).await?;
 
     result
@@ -90,9 +101,8 @@ pub async fn run_ui(
 
 fn run_ui_blocking(
     ui_state: Arc<StdMutex<UiState>>,
-    torrent_name: String,
-    total_length: u64,
     mut rx: mpsc::Receiver<UiUpdate>,
+    setup_tx: tokio::sync::oneshot::Sender<(String, String)>,
     token: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     enable_raw_mode()?;
@@ -110,6 +120,11 @@ fn run_ui_blocking(
     let mut down_speed = 0f64;
     let mut up_speed = 0f64;
     let mut confirm_exit = false;
+
+    let mut setup_tx_opt = Some(setup_tx);
+    let mut input_torrent = String::new();
+    let mut input_download = String::from("/home/daksh/Downloads");
+    let mut setup_step = 0;
 
     loop {
         if token.is_cancelled() {
@@ -153,10 +168,21 @@ fn run_ui_blocking(
                 UiUpdate::Log(msg) => {
                     state.logs.push(msg);
                 }
+                UiUpdate::Init { torrent_name, total_length, num_pieces, file_names } => {
+                    state.torrent_name = torrent_name;
+                    state.total_length = total_length;
+                    state.total_pieces = num_pieces;
+                    state.needed_count = num_pieces as usize;
+                    state.pieces = vec![PieceStatus::Missing; num_pieces as usize];
+                    state.file_names = file_names;
+                }
+                UiUpdate::TrackersQueried(trackers) => {
+                    state.trackers = trackers;
+                }
             }
         }
 
-        let (downloaded, uploaded, needed, total_p, complete, peers_count, active_tab) = {
+        let (downloaded, uploaded, needed, total_p, complete, peers_count, active_tab, total_length) = {
             let state = ui_state.lock().unwrap();
             (
                 state.downloaded_bytes,
@@ -166,6 +192,7 @@ fn run_ui_blocking(
                 state.complete,
                 state.active_peers,
                 state.active_tab,
+                state.total_length,
             )
         };
 
@@ -209,43 +236,88 @@ fn run_ui_blocking(
 
         terminal.draw(|f| {
             let area = f.area();
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(12), // Header
-                    Constraint::Length(3),  // Tabs
-                    Constraint::Min(0),     // Content
-                    Constraint::Length(1),  // Footer
-                ])
-                .split(area);
+            if active_tab == AppTab::Setup {
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(12), // Header
+                        Constraint::Min(0),     // Content
+                        Constraint::Length(1),  // Footer
+                    ])
+                    .split(area);
+                render_header(f, chunks[0]);
+                render_setup(f, chunks[1], setup_step, &input_torrent, &input_download);
+                render_footer(f, chunks[2], confirm_exit);
+            } else {
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(12), // Header
+                        Constraint::Length(3),  // Tabs
+                        Constraint::Min(0),     // Content
+                        Constraint::Length(1),  // Footer
+                    ])
+                    .split(area);
 
-            render_header(f, chunks[0]);
-            render_tabs(f, chunks[1], active_tab);
+                render_header(f, chunks[0]);
+                render_tabs(f, chunks[1], active_tab);
 
-            match active_tab {
-                AppTab::Overview => {
-                    let content_chunks = Layout::default()
-                        .direction(Direction::Horizontal)
-                        .constraints([
-                            Constraint::Length(35),
-                            Constraint::Min(0),
-                        ])
-                        .split(chunks[2]);
-
-                    render_stats(f, content_chunks[0], downloaded, uploaded, down_speed, up_speed, peers_count, elapsed, total_length, needed, total_p, progress, &torrent_name);
-                    render_piece_map(f, content_chunks[1], &ui_state);
+                match active_tab {
+                    AppTab::Overview => {
+                        let content_chunks = Layout::default()
+                            .direction(Direction::Horizontal)
+                            .constraints([
+                                Constraint::Length(35),
+                                Constraint::Min(0),
+                            ])
+                            .split(chunks[2]);
+                        
+                        let t_name = ui_state.lock().unwrap().torrent_name.clone();
+                        render_stats(f, content_chunks[0], downloaded, uploaded, down_speed, up_speed, peers_count, elapsed, total_length, needed, total_p, progress, &t_name);
+                        render_piece_map(f, content_chunks[1], &ui_state);
+                    }
+                    AppTab::Trackers => render_trackers(f, chunks[2], &ui_state),
+                    AppTab::Peers => render_peers(f, chunks[2], &ui_state),
+                    AppTab::Files => render_files(f, chunks[2], &ui_state, total_length),
+                    AppTab::Logs => render_logs(f, chunks[2], &ui_state),
+                    AppTab::Setup => {}
                 }
-                AppTab::Peers => render_peers(f, chunks[2], &ui_state),
-                AppTab::Files => render_files(f, chunks[2], &ui_state, total_length),
-                AppTab::Logs => render_logs(f, chunks[2], &ui_state),
-            }
 
-            render_footer(f, chunks[3], confirm_exit);
+                render_footer(f, chunks[3], confirm_exit);
+            }
         })?;
 
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(key) = event::read()? {
-                if confirm_exit {
+                if active_tab == AppTab::Setup {
+                    match key.code {
+                        KeyCode::Char(c) => {
+                            if setup_step == 0 {
+                                input_torrent.push(c);
+                            } else if setup_step == 1 {
+                                input_download.push(c);
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            if setup_step == 0 {
+                                input_torrent.pop();
+                            } else if setup_step == 1 {
+                                input_download.pop();
+                            }
+                        }
+                        KeyCode::Enter => {
+                            if setup_step == 0 {
+                                setup_step = 1;
+                            } else if setup_step == 1 {
+                                if let Some(tx) = setup_tx_opt.take() {
+                                    let _ = tx.send((input_torrent.clone(), input_download.clone()));
+                                    ui_state.lock().unwrap().active_tab = AppTab::Trackers;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                } else if confirm_exit {
                     if key.code == KeyCode::Char('1') {
                         token.cancel();
                         break;
@@ -258,16 +330,19 @@ fn run_ui_blocking(
                         KeyCode::Tab => {
                             let mut state = ui_state.lock().unwrap();
                             state.active_tab = match state.active_tab {
+                                AppTab::Setup => AppTab::Setup,
+                                AppTab::Trackers => AppTab::Overview,
                                 AppTab::Overview => AppTab::Peers,
                                 AppTab::Peers => AppTab::Files,
                                 AppTab::Files => AppTab::Logs,
-                                AppTab::Logs => AppTab::Overview,
+                                AppTab::Logs => AppTab::Trackers,
                             };
                         }
-                        KeyCode::Char('1') => ui_state.lock().unwrap().active_tab = AppTab::Overview,
-                        KeyCode::Char('2') => ui_state.lock().unwrap().active_tab = AppTab::Peers,
-                        KeyCode::Char('3') => ui_state.lock().unwrap().active_tab = AppTab::Files,
-                        KeyCode::Char('4') => ui_state.lock().unwrap().active_tab = AppTab::Logs,
+                        KeyCode::Char('1') => ui_state.lock().unwrap().active_tab = AppTab::Trackers,
+                        KeyCode::Char('2') => ui_state.lock().unwrap().active_tab = AppTab::Overview,
+                        KeyCode::Char('3') => ui_state.lock().unwrap().active_tab = AppTab::Peers,
+                        KeyCode::Char('4') => ui_state.lock().unwrap().active_tab = AppTab::Files,
+                        KeyCode::Char('5') => ui_state.lock().unwrap().active_tab = AppTab::Logs,
                         _ => {}
                     }
                 }
@@ -300,12 +375,14 @@ fn render_header(f: &mut ratatui::Frame, area: Rect) {
 }
 
 fn render_tabs(f: &mut ratatui::Frame, area: Rect, active_tab: AppTab) {
-    let titles = vec!["[1] Overview", "[2] Peers", "[3] Files", "[4] Logs"];
+    let titles = vec!["[1] Trackers", "[2] Overview", "[3] Peers", "[4] Files", "[5] Logs"];
     let index = match active_tab {
-        AppTab::Overview => 0,
-        AppTab::Peers => 1,
-        AppTab::Files => 2,
-        AppTab::Logs => 3,
+        AppTab::Trackers => 0,
+        AppTab::Overview => 1,
+        AppTab::Peers => 2,
+        AppTab::Files => 3,
+        AppTab::Logs => 4,
+        AppTab::Setup => 0,
     };
 
     let tabs = Tabs::new(titles)
@@ -341,7 +418,7 @@ fn render_stats(
 
     let gauge = Gauge::default()
         .block(Block::default().title(torrent_name).borders(Borders::ALL).border_type(BorderType::Rounded))
-        .gauge_style(Style::default().fg(Color::Green).bg(Color::Black))
+        .gauge_style(Style::default().fg(Color::Green))
         .use_unicode(true)
         .ratio(progress)
         .label(format!("{:.1}%", progress * 100.0));
@@ -494,5 +571,72 @@ fn format_duration(seconds: u64) -> String {
         format!("{:02}h {:02}m {:02}s", h, m, s)
     } else {
         format!("{:02}m {:02}s", m, s)
+    }
+}
+
+fn render_setup(f: &mut ratatui::Frame, area: Rect, step: u8, torrent_path: &str, download_path: &str) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(" Setup ");
+
+    let inner_area = block.inner(area);
+    f.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+        ])
+        .margin(2)
+        .split(inner_area);
+
+    let t_style = if step == 0 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
+    let d_style = if step == 1 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
+
+    let torrent_input = Paragraph::new(if step == 0 { format!("{}█", torrent_path) } else { torrent_path.to_string() })
+        .block(Block::default().title(" Torrent File Path ").borders(Borders::ALL))
+        .style(t_style);
+
+    let download_input = Paragraph::new(if step == 1 { format!("{}█", download_path) } else { download_path.to_string() })
+        .block(Block::default().title(" Download Directory ").borders(Borders::ALL))
+        .style(d_style);
+
+    f.render_widget(torrent_input, chunks[0]);
+    f.render_widget(download_input, chunks[1]);
+    
+    let instructions = Paragraph::new("Press Enter to continue, Backspace to delete")
+        .style(Style::default().fg(Color::DarkGray))
+        .alignment(Alignment::Center);
+    
+    f.render_widget(instructions, chunks[2]);
+}
+
+fn render_trackers(f: &mut ratatui::Frame, area: Rect, ui_state: &Arc<StdMutex<UiState>>) {
+    let state = ui_state.lock().unwrap();
+    
+    let block = Block::default()
+        .title(" Trackers ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded);
+        
+    if state.trackers.is_empty() {
+        let msg = Paragraph::new("\n\nQuerying trackers... Please wait a few moments.")
+            .style(Style::default().fg(Color::Yellow))
+            .alignment(Alignment::Center)
+            .block(block);
+        f.render_widget(msg, area);
+    } else {
+        let items: Vec<ListItem> = state.trackers.iter()
+            .map(|t| ListItem::new(Line::from(vec![Span::raw(t.clone())])))
+            .collect();
+            
+        let list = List::new(items)
+            .block(block)
+            .highlight_style(Style::default().add_modifier(Modifier::BOLD));
+            
+        f.render_widget(list, area);
     }
 }

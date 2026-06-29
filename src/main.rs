@@ -18,43 +18,46 @@ use crate::{download::{DownloadState,run_download}, peer::PeerRegistry};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-    let mut torrent_path = String::new();
-    println!("Enter the path of the torrent: ");
-    io::stdin().read_line(&mut torrent_path).expect("Failed to read path");
+    let (ui_tx, ui_rx) = tokio::sync::mpsc::channel(10000);
+    let (setup_tx, setup_rx) = tokio::sync::oneshot::channel();
+    let token = tokio_util::sync::CancellationToken::new();
+
+    let ui_state = Arc::new(std::sync::Mutex::new(ui::UiState {
+        downloaded_bytes: 0,
+        uploaded_bytes: 0,
+        needed_count: 0,
+        total_pieces: 0,
+        complete: false,
+        active_peers: 0,
+        active_tab: ui::AppTab::Setup,
+        pieces: vec![],
+        logs: vec!["[SYSTEM] Torx client initialized".to_string()],
+        peers: vec![],
+        file_names: vec![],
+        trackers: vec![],
+        torrent_name: String::new(),
+        total_length: 0,
+    }));
+
+    let ui_state_clone = Arc::clone(&ui_state);
+    let token_ui = token.clone();
+    let ui_handle = tokio::spawn(async move {
+        let _ = ui::run_ui(ui_state_clone, ui_rx, setup_tx, token_ui).await;
+    });
+
+    let (torrent_path, download_path) = match setup_rx.await {
+        Ok(paths) => paths,
+        Err(_) => return Ok(()),
+    };
 
     let torrent_file = fs::read(torrent_path.trim()).unwrap();
-
     let file_content: Torrent = serde_bencode::from_bytes(&torrent_file).unwrap();
-    
     let info_hash = calculate_info_hash(&torrent_file).unwrap();
-
     let peer_id = generate_id();
-
     let pieces_split = split_pieces(&file_content.info.pieces);
-
-    println!("Fetching peers from trackers...");
-    let peers = collect_all_peers(&file_content, &torrent_file, &peer_id).await?;
-
-    let peers_queue = Arc::new(Mutex::new(peers));
-    let peers_queue_refill = Arc::clone(&peers_queue);
-
-    let peer_id_bytes: [u8; 20] = peer_id.as_bytes().try_into().expect("Length Mismatch");
-    let info_hash_bytes = info_hash.1;
-
-    println!("Found {} peers! Starting connection worker pool...", peers_queue.lock().await.len());
-
-    let mut piece_hashes: Vec<[u8; 20]> = vec![];
-    for piece in pieces_split{
-        piece_hashes.push(piece);
-    }
 
     let (total_length, num_pieces) = calculate_torrent_size(&file_content);
     let standard_piece_length = file_content.info.piece_len;
-
-    let registry = Arc::new(Mutex::new(PeerRegistry::new(num_pieces)));
-    let dl_state = Arc::new(Mutex::new(DownloadState::new(num_pieces)));
-    let arc_piece_hashes = Arc::new(piece_hashes);
-    let single_file_name = file_content.info.name.clone();
 
     let mut file_names = vec![];
     match &file_content.info.mode {
@@ -66,35 +69,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
         }
     }
 
-    let ui_state = Arc::new(std::sync::Mutex::new(ui::UiState {
-        downloaded_bytes: 0,
-        uploaded_bytes: 0,
-        needed_count: num_pieces as usize,
-        total_pieces: num_pieces,
-        complete: false,
-        active_peers: 0,
-        active_tab: ui::AppTab::Overview,
-        pieces: vec![ui::PieceStatus::Missing; num_pieces as usize],
-        logs: vec!["[SYSTEM] Torx client initialized".to_string()],
-        peers: vec![],
+    let _ = ui_tx.send(ui::UiUpdate::Init {
+        torrent_name: file_content.info.name.clone(),
+        total_length,
+        num_pieces,
         file_names,
-    }));
+    }).await;
 
-    let output_dir_path = std::path::Path::new("/home/daksh/Downloads");
-    let storage = Arc::new(crate::storage::FileEntry::new(&file_content, output_dir_path));
+    let mut trackers = vec![];
+    trackers.push(file_content.announce.clone());
+    if let Some(announce_list) = &file_content.announce_list {
+        for t in announce_list {
+            if let Some(url) = t.first() {
+                trackers.push(url.clone());
+            }
+        }
+    }
+    let _ = ui_tx.send(ui::UiUpdate::TrackersQueried(trackers)).await;
+
+    let peers = collect_all_peers(&file_content, &torrent_file, &peer_id).await?;
+
+    let peers_queue = Arc::new(Mutex::new(peers));
+    let peers_queue_refill = Arc::clone(&peers_queue);
+
+    let peer_id_bytes: [u8; 20] = peer_id.as_bytes().try_into().expect("Length Mismatch");
+    let info_hash_bytes = info_hash.1;
+
+    let mut piece_hashes: Vec<[u8; 20]> = vec![];
+    for piece in pieces_split{
+        piece_hashes.push(piece);
+    }
+
+    let registry = Arc::new(Mutex::new(PeerRegistry::new(num_pieces)));
+    let dl_state = Arc::new(Mutex::new(DownloadState::new(num_pieces)));
+    let arc_piece_hashes = Arc::new(piece_hashes);
+
+    let output_dir_path_buf = std::path::PathBuf::from(download_path.trim());
+    let storage = Arc::new(crate::storage::FileEntry::new(&file_content, &output_dir_path_buf));
     
     {
         storage.preallocate().await.unwrap();
     }
 
-    let (ui_tx, ui_rx) = tokio::sync::mpsc::channel(10000);
-
     let (have_tx, _) = tokio::sync::broadcast::channel::<u32>(512);
     let upload_mgr = Arc::new(Mutex::new(upload::UploadManager::new()));
 
     let dl_state_clone = Arc::clone(&dl_state);
-    let token = tokio_util::sync::CancellationToken::new();
-    let token_ui = token.clone();
     let token_upload = token.clone();
     let token_choking = token.clone();
     let token_tracker = token.clone();
@@ -149,10 +169,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
                 }
             }
         }
-    });
-
-    let ui_handle = tokio::spawn(async move {
-        let _ = ui::run_ui(ui_state, single_file_name, total_length, ui_rx, token_ui).await;
     });
 
     let dl_state_upload = Arc::clone(&dl_state);
