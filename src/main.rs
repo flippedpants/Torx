@@ -19,7 +19,7 @@ use crate::{download::{DownloadState,run_download}, peer::PeerRegistry};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     let (ui_tx, ui_rx) = tokio::sync::mpsc::channel(10000);
-    let (setup_tx, setup_rx) = tokio::sync::oneshot::channel();
+    let (setup_tx, mut setup_rx) = tokio::sync::mpsc::channel(10);
     let token = tokio_util::sync::CancellationToken::new();
 
     let ui_state = Arc::new(std::sync::Mutex::new(ui::UiState {
@@ -37,6 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
         trackers: vec![],
         torrent_name: String::new(),
         total_length: 0,
+        setup_error: None,
     }));
 
     let ui_state_clone = Arc::clone(&ui_state);
@@ -45,13 +46,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
         let _ = ui::run_ui(ui_state_clone, ui_rx, setup_tx, token_ui).await;
     });
 
-    let (torrent_path, download_path) = match setup_rx.await {
-        Ok(paths) => paths,
-        Err(_) => return Ok(()),
+    let (_torrent_path, download_path, torrent_file, file_content) = loop {
+        let (t_path, d_path) = match setup_rx.recv().await {
+            Some(paths) => paths,
+            None => return Ok(()),
+        };
+
+        let t_file = match fs::read(t_path.trim()) {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = ui_tx.send(ui::UiUpdate::SetupError(format!("Failed to read torrent file: {}", e))).await;
+                continue;
+            }
+        };
+
+        let content: Torrent = match serde_bencode::from_bytes(&t_file) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = ui_tx.send(ui::UiUpdate::SetupError(format!("Failed to parse torrent file: {}", e))).await;
+                continue;
+            }
+        };
+        
+        break (t_path, d_path, t_file, content);
     };
 
-    let torrent_file = fs::read(torrent_path.trim()).unwrap();
-    let file_content: Torrent = serde_bencode::from_bytes(&torrent_file).unwrap();
     let info_hash = calculate_info_hash(&torrent_file).unwrap();
     let peer_id = generate_id();
     let pieces_split = split_pieces(&file_content.info.pieces);
@@ -87,7 +106,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
     }
     let _ = ui_tx.send(ui::UiUpdate::TrackersQueried(trackers)).await;
 
-    let peers = collect_all_peers(&file_content, &torrent_file, &peer_id).await?;
+    let peers = collect_all_peers(&file_content, &torrent_file, &peer_id, token.clone()).await?;
+    let _ = ui_tx.send(ui::UiUpdate::StartTimer).await;
 
     let peers_queue = Arc::new(Mutex::new(peers));
     let peers_queue_refill = Arc::clone(&peers_queue);
@@ -156,7 +176,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
                 _ = token_tracker.cancelled() => break,
                 _ = interval.tick() => {
                     let _ = ui_tx_tracker.send(ui::UiUpdate::Log("[SYSTEM] Fetching more peers from trackers...".to_string())).await;
-                    if let Ok(new_peers) = collect_all_peers(&file_content_tracker, &torrent_file_tracker, &peer_id_tracker).await {
+                    if let Ok(new_peers) = collect_all_peers(&file_content_tracker, &torrent_file_tracker, &peer_id_tracker, token_tracker.clone()).await {
                         let mut q = peers_queue_refill.lock().await;
                         // Avoid adding existing peers (basic dedup by ip/port)
                         for p in new_peers {

@@ -247,7 +247,8 @@ fn hash_encoding(text: String) -> String{
 pub async fn collect_all_peers(
     file_content: &parser::Torrent, 
     torrent_file: &Vec<u8>, 
-    peer_id: &str
+    peer_id: &str,
+    token: tokio_util::sync::CancellationToken
 ) -> Result<Vec<PeerAddress>, Box<dyn std::error::Error + Send + Sync>> {
     
     let (total_length, _) = calculate_torrent_size(file_content);
@@ -280,52 +281,70 @@ pub async fn collect_all_peers(
     
     let mut all_peers = HashSet::new();
     let http_client = reqwest::Client::new();
+    let mut handles = Vec::new();
     
     for url in final_urls {
-        crate::logger::log(&format!("[SYSTEM] Announcing to tracker: {}", url));
-        println!("Querying tracker: {}", url);
+        let http_client = http_client.clone();
+        let url = url.clone();
+        let info_hash = info_hash.clone();
+        let peer_id = peer_id.to_string();
         
-        if url.starts_with("http://") || url.starts_with("https://") {
-            let encoded_info_hash = hash_encoding(info_hash.0.clone());
-            let request_url = format!("{}?info_hash={}&peer_id={}&port=6881&uploaded=0&downloaded=0&left={}&compact=1&numwant=200",
-                                url, encoded_info_hash, peer_id, total_length);
+        handles.push(tokio::spawn(async move {
+            crate::logger::log(&format!("[SYSTEM] Announcing to tracker: {}", url));
+            let mut peers_found = Vec::new();
             
-            if let Ok(response) = http_client.get(&request_url).timeout(Duration::from_secs(5)).send().await {
-                if let Ok(bytes) = response.bytes().await {
-                    match crate::response::parse_response(&bytes) {
-                        Ok(peers) => {
-                            for peer in peers {
-                                all_peers.insert(peer);
+            if url.starts_with("http://") || url.starts_with("https://") {
+                let encoded_info_hash = hash_encoding(info_hash.0.clone());
+                let request_url = format!("{}?info_hash={}&peer_id={}&port=6881&uploaded=0&downloaded=0&left={}&compact=1&numwant=200",
+                                    url, encoded_info_hash, peer_id, total_length);
+                
+                if let Ok(response) = http_client.get(&request_url).timeout(Duration::from_secs(5)).send().await {
+                    if let Ok(bytes) = response.bytes().await {
+                        match crate::response::parse_response(&bytes) {
+                            Ok(peers) => {
+                                for peer in peers {
+                                    peers_found.push(peer);
+                                }
+                            }
+                            Err(e) => {
+                                crate::logger::log(&format!("[SYSTEM] HTTP Tracker error parsing response: {}", e));
                             }
                         }
-                        Err(e) => {
-                            crate::logger::log(&format!("[SYSTEM] HTTP Tracker error parsing response: {}", e));
-                            println!("HTTP Tracker error: {}", e);
-                        }
+                    } else {
+                        crate::logger::log("[SYSTEM] Failed to read HTTP tracker response bytes");
                     }
                 } else {
-                    crate::logger::log("[SYSTEM] Failed to read HTTP tracker response bytes");
-                    println!("Failed to read HTTP tracker response bytes");
+                    crate::logger::log("[SYSTEM] HTTP Tracker request failed or timed out");
                 }
-            } else {
-                crate::logger::log("[SYSTEM] HTTP Tracker request failed or timed out");
-                println!("HTTP Tracker request failed or timed out");
-            }
-        } else if url.starts_with("udp://") {
-            match request_udp_tracker(&url, &info_hash.1, peer_id, total_length).await {
-                Ok(peers) => {
-                    for peer in peers {
-                        all_peers.insert(peer);
+            } else if url.starts_with("udp://") {
+                match request_udp_tracker(&url, &info_hash.1, &peer_id, total_length).await {
+                    Ok(peers) => {
+                        for peer in peers {
+                            peers_found.push(peer);
+                        }
+                    }
+                    Err(e) => {
+                        crate::logger::log(&format!("[SYSTEM] UDP Tracker error: {}", e));
                     }
                 }
-                Err(e) => {
-                    crate::logger::log(&format!("[SYSTEM] UDP Tracker error: {}", e));
-                    println!("UDP Tracker error: {}", e);
+            }
+            peers_found
+        }));
+    }
+    
+    for mut handle in handles {
+        tokio::select! {
+            _ = token.cancelled() => {
+                return Err("Cancelled by user".into());
+            }
+            res = &mut handle => {
+                if let Ok(peers) = res {
+                    for p in peers {
+                        all_peers.insert(p);
+                    }
                 }
             }
         }
-        
-        tokio::time::sleep(Duration::from_secs(2)).await;
     }
     
     Ok(all_peers.into_iter().collect())

@@ -64,6 +64,8 @@ pub enum UiUpdate {
         file_names: Vec<String>,
     },
     TrackersQueried(Vec<String>),
+    SetupError(String),
+    StartTimer,
 }
 
 /// Snapshot of download state for the UI to read without holding a tokio lock.
@@ -82,12 +84,13 @@ pub struct UiState {
     pub trackers: Vec<String>,
     pub torrent_name: String,
     pub total_length: u64,
+    pub setup_error: Option<String>,
 }
 
 pub async fn run_ui(
     ui_state: Arc<StdMutex<UiState>>,
     rx: mpsc::Receiver<UiUpdate>,
-    setup_tx: tokio::sync::oneshot::Sender<(String, String)>,
+    setup_tx: mpsc::Sender<(String, String)>,
     token: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let token_clone = token.clone();
@@ -102,7 +105,7 @@ pub async fn run_ui(
 fn run_ui_blocking(
     ui_state: Arc<StdMutex<UiState>>,
     mut rx: mpsc::Receiver<UiUpdate>,
-    setup_tx: tokio::sync::oneshot::Sender<(String, String)>,
+    setup_tx: mpsc::Sender<(String, String)>,
     token: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     enable_raw_mode()?;
@@ -111,7 +114,7 @@ fn run_ui_blocking(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let start_time = Instant::now();
+    let mut start_time: Option<Instant> = None;
     let mut last_tick = Instant::now();
     let mut last_downloaded = 0u64;
     let mut last_uploaded = 0u64;
@@ -121,9 +124,9 @@ fn run_ui_blocking(
     let mut up_speed = 0f64;
     let mut confirm_exit = false;
 
-    let mut setup_tx_opt = Some(setup_tx);
+    let setup_tx = setup_tx.clone();
     let mut input_torrent = String::new();
-    let mut input_download = String::from("/home/daksh/Downloads");
+    let mut input_download = String::new();
     let mut setup_step = 0;
 
     loop {
@@ -179,6 +182,14 @@ fn run_ui_blocking(
                 UiUpdate::TrackersQueried(trackers) => {
                     state.trackers = trackers;
                 }
+                UiUpdate::SetupError(err) => {
+                    state.setup_error = Some(err);
+                    state.active_tab = AppTab::Setup;
+                    setup_step = 0;
+                }
+                UiUpdate::StartTimer => {
+                    start_time = Some(Instant::now());
+                }
             }
         }
 
@@ -232,7 +243,11 @@ fn run_ui_blocking(
             0.0
         };
 
-        let elapsed = start_time.elapsed().as_secs();
+        let elapsed = if let Some(st) = start_time {
+            st.elapsed().as_secs()
+        } else {
+            0
+        };
 
         terminal.draw(|f| {
             let area = f.area();
@@ -246,7 +261,7 @@ fn run_ui_blocking(
                     ])
                     .split(area);
                 render_header(f, chunks[0]);
-                render_setup(f, chunks[1], setup_step, &input_torrent, &input_download);
+                render_setup(f, chunks[1], setup_step, &input_torrent, &input_download, &ui_state);
                 render_footer(f, chunks[2], confirm_exit);
             } else {
                 let chunks = Layout::default()
@@ -309,10 +324,8 @@ fn run_ui_blocking(
                             if setup_step == 0 {
                                 setup_step = 1;
                             } else if setup_step == 1 {
-                                if let Some(tx) = setup_tx_opt.take() {
-                                    let _ = tx.send((input_torrent.clone(), input_download.clone()));
-                                    ui_state.lock().unwrap().active_tab = AppTab::Trackers;
-                                }
+                                let _ = setup_tx.blocking_send((input_torrent.clone(), input_download.clone()));
+                                ui_state.lock().unwrap().active_tab = AppTab::Trackers;
                             }
                         }
                         _ => {}
@@ -574,7 +587,7 @@ fn format_duration(seconds: u64) -> String {
     }
 }
 
-fn render_setup(f: &mut ratatui::Frame, area: Rect, step: u8, torrent_path: &str, download_path: &str) {
+fn render_setup(f: &mut ratatui::Frame, area: Rect, step: u8, torrent_path: &str, download_path: &str, ui_state: &Arc<StdMutex<UiState>>) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -607,11 +620,18 @@ fn render_setup(f: &mut ratatui::Frame, area: Rect, step: u8, torrent_path: &str
     f.render_widget(torrent_input, chunks[0]);
     f.render_widget(download_input, chunks[1]);
     
-    let instructions = Paragraph::new("Press Enter to continue, Backspace to delete")
-        .style(Style::default().fg(Color::DarkGray))
-        .alignment(Alignment::Center);
-    
-    f.render_widget(instructions, chunks[2]);
+    let state = ui_state.lock().unwrap();
+    if let Some(err) = &state.setup_error {
+        let err_msg = Paragraph::new(format!("Error: {}", err))
+            .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+            .alignment(Alignment::Center);
+        f.render_widget(err_msg, chunks[2]);
+    } else {
+        let instructions = Paragraph::new("Press Enter to continue, Backspace to delete")
+            .style(Style::default().fg(Color::DarkGray))
+            .alignment(Alignment::Center);
+        f.render_widget(instructions, chunks[2]);
+    }
 }
 
 fn render_trackers(f: &mut ratatui::Frame, area: Rect, ui_state: &Arc<StdMutex<UiState>>) {
