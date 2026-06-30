@@ -304,7 +304,16 @@ fn run_ui_blocking(
 
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(key) = event::read()? {
-                if active_tab == AppTab::Setup {
+                if confirm_exit {
+                    if key.code == KeyCode::Char('1') {
+                        token.cancel();
+                        break;
+                    } else {
+                        confirm_exit = false;
+                    }
+                } else if key.code == KeyCode::Char('b') && key.modifiers.contains(event::KeyModifiers::CONTROL) {
+                    confirm_exit = true;
+                } else if active_tab == AppTab::Setup {
                     match key.code {
                         KeyCode::Char(c) => {
                             if setup_step == 0 {
@@ -330,16 +339,8 @@ fn run_ui_blocking(
                         }
                         _ => {}
                     }
-                } else if confirm_exit {
-                    if key.code == KeyCode::Char('1') {
-                        token.cancel();
-                        break;
-                    } else {
-                        confirm_exit = false;
-                    }
                 } else {
                     match key.code {
-                        KeyCode::Char('q') => confirm_exit = true,
                         KeyCode::Tab => {
                             let mut state = ui_state.lock().unwrap();
                             state.active_tab = match state.active_tab {
@@ -554,7 +555,7 @@ fn render_footer(f: &mut ratatui::Frame, area: Rect, confirm_exit: bool) {
     let text = if confirm_exit {
         Span::styled("Are you sure? [1] Confirm Exit  [Any] Cancel", Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD))
     } else {
-        Span::styled(" [Tab] Cycle Tabs  [1-4] Switch Tab  [q] Quit ", Style::default().fg(Color::DarkGray))
+        Span::styled(" [Tab] Cycle Tabs  [1-4] Switch Tab  [Ctrl+B] Exit ", Style::default().fg(Color::DarkGray))
     };
     let p = Paragraph::new(Line::from(text)).alignment(Alignment::Center);
     f.render_widget(p, area);
@@ -627,7 +628,7 @@ fn render_setup(f: &mut ratatui::Frame, area: Rect, step: u8, torrent_path: &str
             .alignment(Alignment::Center);
         f.render_widget(err_msg, chunks[2]);
     } else {
-        let instructions = Paragraph::new("Press Enter to continue, Backspace to delete")
+        let instructions = Paragraph::new("Press Enter to continue, Backspace to delete, Ctrl+B to exit")
             .style(Style::default().fg(Color::DarkGray))
             .alignment(Alignment::Center);
         f.render_widget(instructions, chunks[2]);

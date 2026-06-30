@@ -7,5 +7,5 @@
 - [x] Download a piece
 - [x] Connect to multiple peers concurently
 - [x] Track pieces
-- [ ] Handle other peers piece requests
+- [x] Handle other peers piece requests
 - [x] implement udp tracker request
