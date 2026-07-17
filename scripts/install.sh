@@ -4,7 +4,7 @@
 
 set -e
 
-REPO="flippedpanst/torx"
+REPO="flippedpants/torx"
 BINARY="torx"
 INSTALL_DIR=""
 VERSION=""

@@ -47,4 +47,3 @@ pub fn parse_response(response_byte: &bytes::Bytes) -> Result<Vec<PeerAddress>, 
 
     Ok(peer_list)
 }   
-
