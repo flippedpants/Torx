@@ -41,6 +41,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
         torrent_name: String::new(),
         total_length: 0,
         setup_error: None,
+        log_scroll_offset: 0,
+        log_auto_scroll: true,
     }));
 
     let ui_state_clone = Arc::clone(&ui_state);

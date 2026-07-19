@@ -85,6 +85,8 @@ pub struct UiState {
     pub torrent_name: String,
     pub total_length: u64,
     pub setup_error: Option<String>,
+    pub log_scroll_offset: usize,
+    pub log_auto_scroll: bool,
 }
 
 pub async fn run_ui(
@@ -172,6 +174,10 @@ fn run_ui_blocking(
                 }
                 UiUpdate::Log(msg) => {
                     state.logs.push(msg);
+                    if state.log_auto_scroll {
+                        // Will be clamped during render, just set to a large value
+                        state.log_scroll_offset = usize::MAX;
+                    }
                 }
                 UiUpdate::Init { torrent_name, total_length, num_pieces, file_names } => {
                     state.torrent_name = torrent_name;
@@ -264,7 +270,7 @@ fn run_ui_blocking(
                     .split(area);
                 render_header(f, chunks[0]);
                 render_setup(f, chunks[1], setup_step, &input_torrent, &input_download, torrent_cursor, download_cursor, &ui_state);
-                render_footer(f, chunks[2], confirm_exit);
+                render_footer(f, chunks[2], confirm_exit, active_tab);
             } else {
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
@@ -300,7 +306,7 @@ fn run_ui_blocking(
                     AppTab::Setup => {}
                 }
 
-                render_footer(f, chunks[3], confirm_exit);
+                render_footer(f, chunks[3], confirm_exit, active_tab);
             }
         })?;
 
@@ -378,6 +384,49 @@ fn run_ui_blocking(
                         _ => {}
                     }
                 } else {
+                    // Handle scroll keys when on the Logs tab
+                    if active_tab == AppTab::Logs {
+                        match key.code {
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                let mut state = ui_state.lock().unwrap();
+                                state.log_scroll_offset = state.log_scroll_offset.saturating_sub(1);
+                                state.log_auto_scroll = false;
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                let mut state = ui_state.lock().unwrap();
+                                let max = state.logs.len().saturating_sub(1);
+                                state.log_scroll_offset = (state.log_scroll_offset + 1).min(max);
+                                // Re-enable auto-scroll if we've scrolled to the bottom
+                                if state.log_scroll_offset >= max {
+                                    state.log_auto_scroll = true;
+                                }
+                            }
+                            KeyCode::PageUp => {
+                                let mut state = ui_state.lock().unwrap();
+                                state.log_scroll_offset = state.log_scroll_offset.saturating_sub(20);
+                                state.log_auto_scroll = false;
+                            }
+                            KeyCode::PageDown => {
+                                let mut state = ui_state.lock().unwrap();
+                                let max = state.logs.len().saturating_sub(1);
+                                state.log_scroll_offset = (state.log_scroll_offset + 20).min(max);
+                                if state.log_scroll_offset >= max {
+                                    state.log_auto_scroll = true;
+                                }
+                            }
+                            KeyCode::Home => {
+                                let mut state = ui_state.lock().unwrap();
+                                state.log_scroll_offset = 0;
+                                state.log_auto_scroll = false;
+                            }
+                            KeyCode::End => {
+                                let mut state = ui_state.lock().unwrap();
+                                state.log_scroll_offset = state.logs.len().saturating_sub(1);
+                                state.log_auto_scroll = true;
+                            }
+                            _ => {}
+                        }
+                    }
                     match key.code {
                         KeyCode::Tab => {
                             let mut state = ui_state.lock().unwrap();
@@ -575,25 +624,62 @@ fn render_files(f: &mut ratatui::Frame, area: Rect, ui_state: &Arc<StdMutex<UiSt
 }
 
 fn render_logs(f: &mut ratatui::Frame, area: Rect, ui_state: &Arc<StdMutex<UiState>>) {
-    let logs = {
+    let (logs, scroll_offset, auto_scroll) = {
         let state = ui_state.lock().unwrap();
-        state.logs.clone()
+        (state.logs.clone(), state.log_scroll_offset, state.log_auto_scroll)
     };
 
-    let list_items: Vec<ListItem> = logs.iter().rev().take(100).map(|log| {
-        ListItem::new(Text::raw(log))
-    }).collect();
+    let total = logs.len();
+    // Border + title takes 2 lines top and 1 line bottom
+    let visible_height = (area.height as usize).saturating_sub(2);
 
-    let list = List::new(list_items)
-        .block(Block::default().title("Event Logs").borders(Borders::ALL).border_type(BorderType::Rounded));
+    // Clamp scroll offset so the view never goes past the last log
+    let max_offset = total.saturating_sub(visible_height);
+    let offset = if auto_scroll {
+        max_offset
+    } else {
+        scroll_offset.min(max_offset)
+    };
+
+    // Update the clamped offset back into state
+    {
+        let mut state = ui_state.lock().unwrap();
+        state.log_scroll_offset = offset;
+    }
+
+    let visible_logs: Vec<ListItem> = logs
+        .iter()
+        .skip(offset)
+        .take(visible_height)
+        .map(|log| ListItem::new(Text::raw(log)))
+        .collect();
+
+    let scroll_indicator = if total > visible_height {
+        let position = if max_offset > 0 {
+            (offset as f64 / max_offset as f64 * 100.0) as usize
+        } else {
+            100
+        };
+        format!(" Event Logs [{}/{} — {}%] ", offset + visible_height.min(total), total, position)
+    } else {
+        format!(" Event Logs [{}] ", total)
+    };
+
+    let list = List::new(visible_logs)
+        .block(Block::default()
+            .title(scroll_indicator)
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded));
     f.render_widget(list, area);
 }
 
-fn render_footer(f: &mut ratatui::Frame, area: Rect, confirm_exit: bool) {
+fn render_footer(f: &mut ratatui::Frame, area: Rect, confirm_exit: bool, active_tab: AppTab) {
     let text = if confirm_exit {
         Span::styled("Are you sure? [1] Confirm Exit  [Any] Cancel", Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD))
+    } else if active_tab == AppTab::Logs {
+        Span::styled(" [↑/↓] Scroll  [PgUp/PgDn] Page  [Home/End] Jump  [Tab] Cycle Tabs  [Ctrl+B] Exit ", Style::default().fg(Color::DarkGray))
     } else {
-        Span::styled(" [Tab] Cycle Tabs  [1-4] Switch Tab  [Ctrl+B] Exit ", Style::default().fg(Color::DarkGray))
+        Span::styled(" [Tab] Cycle Tabs  [1-5] Switch Tab  [Ctrl+B] Exit ", Style::default().fg(Color::DarkGray))
     };
     let p = Paragraph::new(Line::from(text)).alignment(Alignment::Center);
     f.render_widget(p, area);
