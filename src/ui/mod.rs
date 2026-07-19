@@ -127,6 +127,8 @@ fn run_ui_blocking(
     let setup_tx = setup_tx.clone();
     let mut input_torrent = String::new();
     let mut input_download = String::new();
+    let mut torrent_cursor = 0;
+    let mut download_cursor = 0;
     let mut setup_step = 0;
 
     loop {
@@ -261,7 +263,7 @@ fn run_ui_blocking(
                     ])
                     .split(area);
                 render_header(f, chunks[0]);
-                render_setup(f, chunks[1], setup_step, &input_torrent, &input_download, &ui_state);
+                render_setup(f, chunks[1], setup_step, &input_torrent, &input_download, torrent_cursor, download_cursor, &ui_state);
                 render_footer(f, chunks[2], confirm_exit);
             } else {
                 let chunks = Layout::default()
@@ -317,16 +319,52 @@ fn run_ui_blocking(
                     match key.code {
                         KeyCode::Char(c) => {
                             if setup_step == 0 {
-                                input_torrent.push(c);
+                                let byte_idx = input_torrent.char_indices().nth(torrent_cursor).map(|(i, _)| i).unwrap_or(input_torrent.len());
+                                input_torrent.insert(byte_idx, c);
+                                torrent_cursor += 1;
                             } else if setup_step == 1 {
-                                input_download.push(c);
+                                let byte_idx = input_download.char_indices().nth(download_cursor).map(|(i, _)| i).unwrap_or(input_download.len());
+                                input_download.insert(byte_idx, c);
+                                download_cursor += 1;
                             }
                         }
                         KeyCode::Backspace => {
                             if setup_step == 0 {
-                                input_torrent.pop();
+                                if torrent_cursor > 0 {
+                                    torrent_cursor -= 1;
+                                    let byte_idx = input_torrent.char_indices().nth(torrent_cursor).unwrap().0;
+                                    input_torrent.remove(byte_idx);
+                                }
                             } else if setup_step == 1 {
-                                input_download.pop();
+                                if download_cursor > 0 {
+                                    download_cursor -= 1;
+                                    let byte_idx = input_download.char_indices().nth(download_cursor).unwrap().0;
+                                    input_download.remove(byte_idx);
+                                }
+                            }
+                        }
+                        KeyCode::Left => {
+                            if setup_step == 0 && torrent_cursor > 0 {
+                                torrent_cursor -= 1;
+                            } else if setup_step == 1 && download_cursor > 0 {
+                                download_cursor -= 1;
+                            }
+                        }
+                        KeyCode::Right => {
+                            if setup_step == 0 && torrent_cursor < input_torrent.chars().count() {
+                                torrent_cursor += 1;
+                            } else if setup_step == 1 && download_cursor < input_download.chars().count() {
+                                download_cursor += 1;
+                            }
+                        }
+                        KeyCode::Up => {
+                            if setup_step == 1 {
+                                setup_step = 0;
+                            }
+                        }
+                        KeyCode::Down => {
+                            if setup_step == 0 {
+                                setup_step = 1;
                             }
                         }
                         KeyCode::Enter => {
@@ -588,7 +626,7 @@ fn format_duration(seconds: u64) -> String {
     }
 }
 
-fn render_setup(f: &mut ratatui::Frame, area: Rect, step: u8, torrent_path: &str, download_path: &str, ui_state: &Arc<StdMutex<UiState>>) {
+fn render_setup(f: &mut ratatui::Frame, area: Rect, step: u8, torrent_path: &str, download_path: &str, t_cursor: usize, d_cursor: usize, ui_state: &Arc<StdMutex<UiState>>) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -610,11 +648,36 @@ fn render_setup(f: &mut ratatui::Frame, area: Rect, step: u8, torrent_path: &str
     let t_style = if step == 0 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
     let d_style = if step == 1 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
 
-    let torrent_input = Paragraph::new(if step == 0 { format!("{}█", torrent_path) } else { torrent_path.to_string() })
+    let format_input = |text: &str, cursor: usize, is_active: bool| -> ratatui::text::Line {
+        if !is_active {
+            return Line::from(text.to_string());
+        }
+        let char_count = text.chars().count();
+        if cursor >= char_count {
+            Line::from(vec![
+                Span::raw(text.to_string()),
+                Span::styled("█", Style::default()),
+            ])
+        } else {
+            let byte_idx = text.char_indices().nth(cursor).unwrap().0;
+            let (before, rest) = text.split_at(byte_idx);
+            let mut chars = rest.chars();
+            let c = chars.next().unwrap();
+            let after = chars.as_str();
+            
+            Line::from(vec![
+                Span::raw(before.to_string()),
+                Span::styled(c.to_string(), Style::default().add_modifier(Modifier::REVERSED)),
+                Span::raw(after.to_string()),
+            ])
+        }
+    };
+
+    let torrent_input = Paragraph::new(format_input(torrent_path, t_cursor, step == 0))
         .block(Block::default().title(" Torrent File Path ").borders(Borders::ALL))
         .style(t_style);
 
-    let download_input = Paragraph::new(if step == 1 { format!("{}█", download_path) } else { download_path.to_string() })
+    let download_input = Paragraph::new(format_input(download_path, d_cursor, step == 1))
         .block(Block::default().title(" Download Directory ").borders(Borders::ALL))
         .style(d_style);
 

@@ -146,7 +146,13 @@ pub async fn request_udp_tracker(url_str: &str, info_hash: &[u8; 20], peer_id_st
     let mut addrs = tokio::net::lookup_host(&addr).await?;
     let target_addr = addrs.next().ok_or("DNS resolution failed")?;
 
-    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    let bind_addr = if target_addr.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+
+    let socket = UdpSocket::bind(bind_addr).await?;
     socket.connect(target_addr).await?;
 
     let transaction_id: u32 = rand::random();
