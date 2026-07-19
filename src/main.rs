@@ -8,6 +8,7 @@ mod ui;
 mod logger;
 mod storage;
 mod upload;
+mod cli;
 
 use std::{fs::{self}, io, sync::Arc};
 use parser::Torrent;
@@ -18,6 +19,8 @@ use crate::{download::{DownloadState,run_download}, peer::PeerRegistry};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+    let _cli = cli::parse_args();
+
     let (ui_tx, ui_rx) = tokio::sync::mpsc::channel(10000);
     let (setup_tx, mut setup_rx) = tokio::sync::mpsc::channel(10);
     let token = tokio_util::sync::CancellationToken::new();
