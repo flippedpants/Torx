@@ -312,6 +312,9 @@ fn run_ui_blocking(
 
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(key) = event::read()? {
+                if key.kind != event::KeyEventKind::Press {
+                    continue;
+                }
                 if confirm_exit {
                     if key.code == KeyCode::Char('1') {
                         token.cancel();

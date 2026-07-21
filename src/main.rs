@@ -88,7 +88,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
         parser::FileMode::SingleFileMode { .. } => file_names.push(file_content.info.name.clone()),
         parser::FileMode::MultiFileMode { files } => {
             for f in files {
-                file_names.push(f.path.join("/"));
+                let path: std::path::PathBuf = f.path.iter().collect();
+                file_names.push(path.to_string_lossy().into_owned());
             }
         }
     }
