@@ -48,18 +48,23 @@ brew install flippedpants/torx/torx
 
 ### Windows
 
-#### Winget
+#### Scoop
+If you dont have scoop package manager, run these commmands on your terminal - 
+```powershell
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+Invoke-RestMethod -Uri https://get.scoop.sh | Invoke-Expression
+```
 
-<!-- TODO: Add Scoop and Winget installation once packages are published -->
-<!-- Expected usage:
+Add the bucket - 
+```powershell
+scoop bucket add torx https://github.com/flippedpants/scoop-bucket
+```
+
+Then install - 
 ```powershell
 scoop install torx
-# or
-winget install flippedpants.torx
 ```
--->
 
-> **Coming soon** — Winget packages are not yet available.
 
 ### Build from Source
 
