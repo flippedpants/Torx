@@ -21,6 +21,8 @@ Built for speed and transparency, Torx renders a live TUI (powered by Ratatui + 
 - **Interactive TUI** — real-time stats, piece map, peer table, file list, and logger
 - **Cross-platform** — builds for Linux, macOS, and Windows
 
+<img width="959" height="573" alt="Screenshot 2026-07-22 201524" src="https://github.com/user-attachments/assets/cb3a1baa-d763-44b8-810b-1ff17098d4ad" />
+
 ## Installation
 
 ### Linux & macOS
